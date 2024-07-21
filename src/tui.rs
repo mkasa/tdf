@@ -5,7 +5,7 @@ use std::{
 };
 
 use crossterm::{
-	event::{Event, KeyCode, MouseEventKind},
+	event::{Event, KeyCode, KeyModifiers, MouseEventKind},
 	execute,
 	terminal::BeginSynchronizedUpdate
 };
@@ -160,7 +160,7 @@ impl Tui {
 
 		let (msg_str, color) = match self.bottom_msg {
 			BottomMessage::Help => (
-				"/: Search, g: Go To Page, n: Next Search Result, N: Previous Search Result"
+				"fb: Next/Prev, op: Zoom In/Out, hjkl: Scroll, G: Lefttop, g: Go To Page, /: Search, n: Next Search, N: Prev Search"
 					.to_string(),
 				Color::Blue
 			),
@@ -449,10 +449,19 @@ impl Tui {
 						_ => Some(InputAction::QuitApp)
 					},
 					KeyCode::Char('q') => Some(InputAction::QuitApp),
-					KeyCode::Char('g') => {
+					KeyCode::Char('g') if key.modifiers == KeyModifiers::NONE => {
 						self.set_bottom_msg(Some(BottomMessage::Input(InputCommand::GoToPage(0))));
 						Some(InputAction::Redraw)
-					}
+					},
+					KeyCode::Char('g') if key.modifiers == KeyModifiers::SHIFT => {
+                        let (x, y) = *self.offset.lock().unwrap();
+                        if x != 0.0 || y != 0.0 {
+                            *self.offset.lock().unwrap() = (0.0, 0.0);
+                            Some(InputAction::ChangeZoomLevel)
+                        } else {
+                            None
+                        }
+                    },
 					KeyCode::Char('/') => {
 						self.set_bottom_msg(Some(BottomMessage::Input(InputCommand::Search(
 							String::new()

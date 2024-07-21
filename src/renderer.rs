@@ -53,14 +53,17 @@ struct PrevRender {
 }
 
 fn log_message_to_file(msg: String) -> () {
-    let mut file = match OpenOptions::new().create(true).append(true).open("/tmp/zoom_level.txt") {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Couldn't open zoom_level.txt: {}", e);
-            return
-        }
-    };
-    file.write_all(msg.as_bytes());
+    #[cfg(debug_assertions)]
+    {
+        let mut file = match OpenOptions::new().create(true).append(true).open("/tmp/zoom_level.txt") {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Couldn't open zoom_level.txt: {}", e);
+                return
+            }
+        };
+        file.write_all(msg.as_bytes());
+    }
 }
 
 pub fn fill_default<T: Default>(vec: &mut Vec<T>, size: usize) {
@@ -276,7 +279,7 @@ pub fn start_rendering(
 								render_ctx_to_png(ctx, &mut sender, (col_w, col_h), num)
 							});
 						}
-                        thread::sleep(std::time::Duration::from_millis(400));
+                        // thread::sleep(std::time::Duration::from_millis(400));
 					}
 					// And if we got an error, then obviously we need to propagate that
 					Err(e) => sender.send(Err(RenderError::Render(e)))?
@@ -370,7 +373,7 @@ fn render_single_page_to_ctx(
         p_width
     } else {
         p_width * zoom_factor
-    };
+    }.min(area_w / scale_factor);
 	let surface_width = p_real_width * scale_factor;
 	let surface_height = p_height * scale_factor;
 
@@ -395,7 +398,7 @@ fn render_single_page_to_ctx(
 	// The default background color of PDFs (at least, I think) is white, so we need to set
 	// that as the background color, then paint, then render.
 	// ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-	ctx.set_source_rgba(0.3, 0.3, 0.3, 1.0);
+	ctx.set_source_rgba(0.0, 0.0, 0.0, 1.0);
 
 	ctx.set_antialias(Antialias::None);
 	// ctx.set_antialias(Antialias::Fast);
