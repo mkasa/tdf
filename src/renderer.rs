@@ -287,11 +287,19 @@ fn render_single_page_to_ctx(
 	search_term: &Option<String>,
 	already_rendered_no_results: bool,
 	(area_w, area_h): (f64, f64)
+    // (offset_x, offset_y): (f64, f64),
+    // zoom_level: f64,
+    // multipage_mode: bool
 ) -> Result<Option<RenderedContext>, String> {
 	let mut result_rects = search_term
 		.as_ref()
 		.map(|term| page.find_text_with_options(term, FindFlags::DEFAULT | FindFlags::MULTILINE))
 		.unwrap_or_default();
+
+
+    let (offset_x, offset_y): (f64, f64) = (150.0, 2.0);
+    let zoom_level: f64 = 2.0;
+    let multipage_mode: bool = false;
 
 	// If there are no search terms on this page, and we've already rendered it with no search
 	// terms, then just return none to avoid this computation
@@ -324,6 +332,7 @@ fn render_single_page_to_ctx(
 
 	let surface_width = p_width * scale_factor;
 	let surface_height = p_height * scale_factor;
+    let zoom_factor = if multipage_mode { 1.0 } else { zoom_level };
 
 	let surface = cairo::ImageSurface::create(
 		Format::Rgb16_565,
@@ -339,7 +348,7 @@ fn render_single_page_to_ctx(
 		surface_height as i32
 	)
 	.map_err(|e| format!("Couldn't create ImageSurface: {e}"))?;
-	surface.set_device_scale(scale_factor, scale_factor);
+	surface.set_device_scale(scale_factor * zoom_factor, scale_factor * zoom_factor);
 
 	let ctx = Context::new(surface).map_err(|e| format!("Couldn't create Context: {e}"))?;
 
@@ -351,6 +360,11 @@ fn render_single_page_to_ctx(
 	// ctx.set_antialias(Antialias::Fast);
 	ctx.paint()
 		.map_err(|e| format!("Couldn't paint Context: {e}"))?;
+
+    ctx.translate(-offset_x, -offset_y);
+    ctx.rectangle(offset_x, offset_y, p_width / zoom_factor, p_height / zoom_factor);
+    ctx.clip();
+
 	page.render(&ctx);
 
 	let num_results = result_rects.len();
