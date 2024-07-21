@@ -65,10 +65,10 @@ struct RenderedInfo {
 }
 
 impl Tui {
-	pub fn new(name: String, should_center: bool) -> Tui {
+	pub fn new(name: String, should_center: bool, initial_page_num: usize) -> Tui {
 		Self {
 			name,
-			page: 0,
+			page: initial_page_num,
             should_center,
 			prev_msg: None,
 			bottom_msg: BottomMessage::Help,

@@ -348,6 +348,7 @@ fn render_single_page_to_ctx(
 	ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
 
 	ctx.set_antialias(Antialias::None);
+	// ctx.set_antialias(Antialias::Fast);
 	ctx.paint()
 		.map_err(|e| format!("Couldn't paint Context: {e}"))?;
 	page.render(&ctx);

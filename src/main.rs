@@ -58,9 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .short('c')
             .long("center")
             .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("page")
+            .help("The page to open the document on")
+            .short('p')
+            .long("page")
+            .value_parser(clap::value_parser!(usize)))
         .get_matches();
     let should_center = matches.get_flag("center");
     let file = matches.get_one::<String>("file").expect("specify a pdf");
+    let initial_page_num = *matches.get_one::<usize>("page").unwrap_or(&1) - 1;
 	let path = PathBuf::from_str(&file)?.canonicalize()?;
 
 	//let (watch_tx, render_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -162,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.map(|n| n.to_string_lossy())
 		.unwrap_or_else(|| "Unknown file".into())
 		.to_string();
-	let mut tui = tui::Tui::new(file_name, should_center);
+	let mut tui = tui::Tui::new(file_name, should_center, initial_page_num);
 
 	let backend = CrosstermBackend::new(std::io::stdout());
 	let mut term = Terminal::new(backend)?;
