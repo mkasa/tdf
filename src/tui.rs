@@ -19,6 +19,7 @@ use crate::{renderer::RenderError, skip::Skip};
 pub struct Tui {
 	name: String,
 	page: usize,
+    should_center: bool,
 	last_render: LastRender,
 	bottom_msg: BottomMessage,
 	// we use `prev_msg` to, for example, restore the 'search results' message on the bottom after
@@ -64,10 +65,11 @@ struct RenderedInfo {
 }
 
 impl Tui {
-	pub fn new(name: String) -> Tui {
+	pub fn new(name: String, should_center: bool) -> Tui {
 		Self {
 			name,
 			page: 0,
+            should_center,
 			prev_msg: None,
 			bottom_msg: BottomMessage::Help,
 			last_render: LastRender::default(),
@@ -227,7 +229,9 @@ impl Tui {
 
 				let unused_width = img_area.width - total_width;
 				self.last_render.unused_width = unused_width;
-				img_area.x += unused_width / 2;
+                if self.should_center {
+                    img_area.x += unused_width / 2;
+                }
 
 				for (page_idx, width) in page_widths {
 					// now, theoretically, when we call this, this page should *not* be None, but we do

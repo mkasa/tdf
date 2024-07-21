@@ -21,6 +21,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use ratatui_image::picker::Picker;
 use renderer::{RenderInfo, RenderNotif};
 use tui::{InputAction, Tui};
+use clap::{Arg, Command};
 
 mod converter;
 mod renderer;
@@ -43,10 +44,23 @@ impl std::error::Error for BadTermSizeStdin {}
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	#[cfg(feature = "tracing")]
 	console_subscriber::init();
-
-	let file = std::env::args()
-		.nth(1)
-		.ok_or("Program requires a file to process")?;
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    let matches = Command::new("tdf")
+        .version(VERSION)
+        .author("itsjunetime")
+        .about("A terminal document viewer (plus a little tweak by mkasa)")
+        .arg(Arg::new("file")
+             .help("The pdf file to open")
+             .required(true)
+             .index(1))
+        .arg(Arg::new("center")
+            .help("Center the images in the terminal")
+            .short('c')
+            .long("center")
+            .action(clap::ArgAction::SetTrue))
+        .get_matches();
+    let should_center = matches.get_flag("center");
+    let file = matches.get_one::<String>("file").expect("specify a pdf");
 	let path = PathBuf::from_str(&file)?.canonicalize()?;
 
 	//let (watch_tx, render_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -148,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.map(|n| n.to_string_lossy())
 		.unwrap_or_else(|| "Unknown file".into())
 		.to_string();
-	let mut tui = tui::Tui::new(file_name);
+	let mut tui = tui::Tui::new(file_name, should_center);
 
 	let backend = CrosstermBackend::new(std::io::stdout());
 	let mut term = Terminal::new(backend)?;
