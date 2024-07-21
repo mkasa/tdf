@@ -86,6 +86,7 @@ pub fn start_rendering(
 	receiver: Receiver<RenderNotif>,
 	size: WindowSize,
     zoom_level: Arc<Mutex<f64>>,
+    offset: Arc<Mutex<(f64, f64)>>,
     multipage_mode: bool
 ) -> Result<(), SendError<Result<RenderInfo, RenderError>>> {
 	// first, wait 'til we get told what the current starting area is so that we can set it to
@@ -153,6 +154,7 @@ pub fn start_rendering(
 						}
                         RenderNotif::ZoomLevelChange => {
                             log_message_to_file(format!("Zoom level changed to {}\n",zoom_level.lock().unwrap().clone()));
+                            log_message_to_file(format!("Offset changed to {:?}\n",offset.lock().unwrap().clone()));
                             continue 'reload;
                         }
 						RenderNotif::JumpToPage(page) => {
@@ -237,13 +239,14 @@ pub fn start_rendering(
 
                 serial_counter += 1;
 				// render the page
-                log_message_to_file(format!("Rendering page {} with zl {}, nr {}\n", num, zoom_level.lock().unwrap().clone(), rendered_with_no_results));
+                log_message_to_file(format!("Rendering page {} with zl {}, of {:?}, nr {}\n", num, zoom_level.lock().unwrap().clone(), offset.lock().unwrap().clone(), rendered_with_no_results));
 				match render_single_page_to_ctx(
 					page,
 					&search_term,
 					rendered_with_no_results,
 					(area_w, area_h),
                     zoom_level.lock().unwrap().clone(),
+                    offset.lock().unwrap().clone(),
                     multipage_mode,
                     serial_counter
 				) {
@@ -321,6 +324,7 @@ fn render_single_page_to_ctx(
 	(area_w, area_h): (f64, f64),
     // (offset_x, offset_y): (f64, f64),
     zoom_level: f64,
+    offset: (f64, f64),
     multipage_mode: bool,
     serial_counter: usize
 ) -> Result<Option<RenderedContext>, String> {
@@ -329,7 +333,7 @@ fn render_single_page_to_ctx(
 		.map(|term| page.find_text_with_options(term, FindFlags::DEFAULT | FindFlags::MULTILINE))
 		.unwrap_or_default();
 
-    let (offset_x, offset_y): (f64, f64) = (150.0, 2.0);
+    let (offset_x, offset_y): (f64, f64) = offset;
 
 	// If there are no search terms on this page, and we've already rendered it with no search
 	// terms, then just return none to avoid this computation

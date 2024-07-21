@@ -61,6 +61,7 @@ const FONT_SIZE: (u16, u16) = (8, 14);
 pub fn start_rendering_loop(
 	path: impl AsRef<Path>,
     zoom_level: Arc<Mutex<f64>>,
+    offset: Arc<Mutex<(f64, f64)>>,
     multipage_mode: bool
 ) -> (
 	RecvStream<'static, Result<RenderInfo, RenderError>>,
@@ -81,7 +82,7 @@ pub fn start_rendering_loop(
 		width: columns * FONT_SIZE.0
 	};
 
-	std::thread::spawn(move || start_rendering(str_path, to_main_tx, from_main_rx, size, zoom_level, multipage_mode));
+	std::thread::spawn(move || start_rendering(str_path, to_main_tx, from_main_rx, size, zoom_level, offset, multipage_mode));
 
 	let main_area = Rect {
 		x: 0,
@@ -121,9 +122,10 @@ pub fn start_converting_loop(
 pub fn start_all_rendering(
     path: impl AsRef<Path>,
     zoom_level: Arc<Mutex<f64>>,
+    offset: Arc<Mutex<(f64, f64)>>,
     multipage_mode: bool
 ) -> RenderState {
-	let (from_render_rx, to_render_tx) = start_rendering_loop(path, zoom_level, multipage_mode);
+	let (from_render_rx, to_render_tx) = start_rendering_loop(path, zoom_level, offset, multipage_mode);
 	let (from_converter_rx, to_converter_tx) = start_converting_loop(20);
 
 	let pages: Vec<Option<ConvertedPage>> = Vec::new();
@@ -140,6 +142,7 @@ pub fn start_all_rendering(
 pub async fn render_doc(
     path: impl AsRef<Path>,
     zoom_level: Arc<Mutex<f64>>,
+    offset: Arc<Mutex<(f64, f64)>>,
     multipage_mode: bool
 ) {
 	let RenderState {
@@ -148,7 +151,7 @@ pub async fn render_doc(
 		mut pages,
 		mut to_converter_tx,
 		to_render_tx
-	} = start_all_rendering(path, zoom_level, multipage_mode);
+	} = start_all_rendering(path, zoom_level, offset, multipage_mode);
 
 	while pages.is_empty() || pages.iter().any(|p| p.is_none()) {
 		tokio::select! {

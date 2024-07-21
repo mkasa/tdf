@@ -167,8 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// since the methods we call in `start_rendering` will panic if called in an async context
     let zoom_level_shared = Arc::new(Mutex::new(zoom_level));
     let zoom_level_shared_1 = Arc::clone(&zoom_level_shared);
+    let offset_shared = Arc::new(Mutex::new((0.0, 0.0)));
+    let offset_shared_1 = Arc::clone(&offset_shared);
 	std::thread::spawn(move || {
-		renderer::start_rendering(file_path, render_tx, render_rx, window_size, zoom_level_shared_1, multiple_page_mode)
+		renderer::start_rendering(file_path, render_tx, render_rx, window_size, zoom_level_shared_1, offset_shared_1, multiple_page_mode)
 	});
 
 	let mut ev_stream = crossterm::event::EventStream::new();
@@ -184,7 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.unwrap_or_else(|| "Unknown file".into())
 		.to_string();
     let zoom_level_shared_2 = Arc::clone(&zoom_level_shared);
-	let mut tui = tui::Tui::new(file_name, should_center, initial_page_num, zoom_level_shared_2, multiple_page_mode);
+    let offset_shared_2 = Arc::clone(&offset_shared);
+	let mut tui = tui::Tui::new(file_name, should_center, initial_page_num, zoom_level_shared_2, offset_shared_2, multiple_page_mode);
 
 	let backend = CrosstermBackend::new(std::io::stdout());
 	let mut term = Terminal::new(backend)?;

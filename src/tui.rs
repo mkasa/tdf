@@ -24,6 +24,7 @@ pub struct Tui {
 	name: String,
 	page: usize,
     zoom_level: Arc<Mutex<f64>>,
+    offset: Arc<Mutex<(f64, f64)>>,
     multipage_mode: bool,
     should_center: bool,
 	last_render: LastRender,
@@ -71,11 +72,12 @@ struct RenderedInfo {
 }
 
 impl Tui {
-	pub fn new(name: String, should_center: bool, initial_page_num: usize, zoom_level: Arc<Mutex<f64>>, multipage_mode: bool) -> Tui {
+	pub fn new(name: String, should_center: bool, initial_page_num: usize, zoom_level: Arc<Mutex<f64>>, offset: Arc<Mutex<(f64, f64)>>, multipage_mode: bool) -> Tui {
 		Self {
 			name,
 			page: initial_page_num,
             zoom_level,
+            offset,
             multipage_mode,
             should_center,
 			prev_msg: None,
