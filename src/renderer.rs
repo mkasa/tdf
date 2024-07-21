@@ -334,6 +334,7 @@ fn render_single_page_to_ctx(
 		.unwrap_or_default();
 
     let (offset_x, offset_y): (f64, f64) = offset;
+    let zoom_factor = if multipage_mode { 1.0 } else { zoom_level };
 
 	// If there are no search terms on this page, and we've already rendered it with no search
 	// terms, then just return none to avoid this computation
@@ -365,10 +366,13 @@ fn render_single_page_to_ctx(
 		area_h / p_height
 	};
 
-	let surface_width = p_width * scale_factor;
+    let p_real_width = if multipage_mode {
+        p_width
+    } else {
+        p_width * zoom_factor
+    };
+	let surface_width = p_real_width * scale_factor;
 	let surface_height = p_height * scale_factor;
-    let zoom_factor = if multipage_mode { 1.0 } else { zoom_level };
-    // eprintln!("zoom factor: {}", zoom_factor);
 
 	let surface = cairo::ImageSurface::create(
 		Format::Rgb16_565,
@@ -390,7 +394,8 @@ fn render_single_page_to_ctx(
 
 	// The default background color of PDFs (at least, I think) is white, so we need to set
 	// that as the background color, then paint, then render.
-	ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+	// ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+	ctx.set_source_rgba(0.3, 0.3, 0.3, 1.0);
 
 	ctx.set_antialias(Antialias::None);
 	// ctx.set_antialias(Antialias::Fast);
@@ -398,7 +403,7 @@ fn render_single_page_to_ctx(
 		.map_err(|e| format!("Couldn't paint Context: {e}"))?;
 
     ctx.translate(-offset_x, -offset_y);
-    ctx.rectangle(offset_x, offset_y, p_width / zoom_factor, p_height / zoom_factor);
+    ctx.rectangle(offset_x, offset_y, p_real_width / zoom_factor, p_height / zoom_factor);
     ctx.clip();
 
 	page.render(&ctx);

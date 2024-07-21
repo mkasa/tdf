@@ -423,6 +423,7 @@ impl Tui {
                         let (mut x, y) = *self.offset.lock().unwrap();
                         if x > 0.0 {
                             x -= 50.0 * *self.zoom_level.lock().unwrap();
+                            x = x.max(0.0);
                             *self.offset.lock().unwrap() = (x, y);
                             Some(InputAction::ChangeZoomLevel)
                         } else {
@@ -433,6 +434,7 @@ impl Tui {
                         let (x, mut y) = *self.offset.lock().unwrap();
                         if y > 0.0 {
                             y -= 50.0 * *self.zoom_level.lock().unwrap();
+                            y = y.max(0.0);
                             *self.offset.lock().unwrap() = (x, y);
                             Some(InputAction::ChangeZoomLevel)
                         } else {
