@@ -377,8 +377,8 @@ impl Tui {
 						}),
                     KeyCode::Char('o') => {
                         let current_zoom_level = self.zoom_level.lock().unwrap().clone();
-                        if current_zoom_level < 16.0 {
-                            *self.zoom_level.lock().unwrap() *= 2.0;
+                        if current_zoom_level < 4.0 {
+                            *self.zoom_level.lock().unwrap() *= 1.5;
                             Some(InputAction::ChangeZoomLevel)
                         } else {
                             None
@@ -387,7 +387,7 @@ impl Tui {
                     KeyCode::Char('p') => {
                         let current_zoom_level = self.zoom_level.lock().unwrap().clone();
                         if current_zoom_level > 1.0 {
-                            *self.zoom_level.lock().unwrap() /= 2.0;
+                            *self.zoom_level.lock().unwrap() /= 1.5;
                             Some(InputAction::ChangeZoomLevel)
                         } else {
                             None

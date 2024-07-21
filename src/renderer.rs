@@ -273,6 +273,7 @@ pub fn start_rendering(
 								render_ctx_to_png(ctx, &mut sender, (col_w, col_h), num)
 							});
 						}
+                        thread::sleep(std::time::Duration::from_millis(400));
 					}
 					// And if we got an error, then obviously we need to propagate that
 					Err(e) => sender.send(Err(RenderError::Render(e)))?
