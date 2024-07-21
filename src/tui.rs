@@ -19,6 +19,7 @@ use crate::{renderer::RenderError, skip::Skip};
 pub struct Tui {
 	name: String,
 	page: usize,
+    zoom_level: f64,
     should_center: bool,
 	last_render: LastRender,
 	bottom_msg: BottomMessage,
@@ -69,6 +70,7 @@ impl Tui {
 		Self {
 			name,
 			page: initial_page_num,
+            zoom_level: 1.0,
             should_center,
 			prev_msg: None,
 			bottom_msg: BottomMessage::Help,
@@ -367,6 +369,18 @@ impl Tui {
 							*page = (*page * 10) + input_num as usize;
 							InputAction::Redraw
 						}),
+                    KeyCode::Char('+') => {
+                        if self.zoom_level < 16.0 {
+                            self.zoom_level *= 2.0;
+                        }
+                        Some(InputAction::Redraw)
+                    },
+                    KeyCode::Char('-') => {
+                        if self.zoom_level > 1.0 {
+                            self.zoom_level /= 2.0;
+                        }
+                        Some(InputAction::Redraw)
+                    },
 					KeyCode::Char('f') =>
 						self.change_page(PageChange::Next, ChangeAmount::Single),
 					KeyCode::Char('b') =>
