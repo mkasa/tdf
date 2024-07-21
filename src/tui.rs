@@ -362,14 +362,14 @@ impl Tui {
 					{
 						term.push(c);
 						Some(InputAction::Redraw)
-					}
+					},
 					KeyCode::Backspace
 						if let BottomMessage::Input(InputCommand::Search(ref mut term)) =
 							self.bottom_msg =>
 					{
 						term.pop();
 						Some(InputAction::Redraw)
-					}
+					},
 					KeyCode::Char(c)
 						if let BottomMessage::Input(InputCommand::GoToPage(ref mut page)) =
 							self.bottom_msg =>
@@ -385,7 +385,7 @@ impl Tui {
                         } else {
                             None
                         }
-                    },
+                    }
                     KeyCode::Char('p') => {
                         let current_zoom_level = self.zoom_level.lock().unwrap().clone();
                         if current_zoom_level > 1.0 {
@@ -394,19 +394,51 @@ impl Tui {
                         } else {
                             None
                         }
-                    },
+                    }
 					KeyCode::PageDown | KeyCode::Char('f') =>
 						self.change_page(PageChange::Next, ChangeAmount::Single),
 					KeyCode::PageUp | KeyCode::Char('b') =>
 						self.change_page(PageChange::Prev, ChangeAmount::Single),
-					KeyCode::Right | KeyCode::Char('l') =>
-						self.change_page(PageChange::Next, ChangeAmount::Single),
-					KeyCode::Down | KeyCode::Char('j') =>
-						self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
-					KeyCode::Left | KeyCode::Char('h') =>
-						self.change_page(PageChange::Prev, ChangeAmount::Single),
-					KeyCode::Up | KeyCode::Char('k') =>
-						self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
+					KeyCode::Right | KeyCode::Char('l') => {
+                        let (mut x, y) = *self.offset.lock().unwrap();
+                        if x < 10000.0 {
+                            x += 50.0 * *self.zoom_level.lock().unwrap();
+                            *self.offset.lock().unwrap() = (x, y);
+                            Some(InputAction::ChangeZoomLevel)
+                        } else {
+                            None
+                        }
+                    },
+					KeyCode::Down | KeyCode::Char('j') => {
+                        let (x, mut y) = *self.offset.lock().unwrap();
+                        if y < 10000.0 {
+                            y += 50.0 * *self.zoom_level.lock().unwrap();
+                            *self.offset.lock().unwrap() = (x, y);
+                            Some(InputAction::ChangeZoomLevel)
+                        } else {
+                            None
+                        }
+                    },
+					KeyCode::Left | KeyCode::Char('h') => {
+                        let (mut x, y) = *self.offset.lock().unwrap();
+                        if x > 0.0 {
+                            x -= 50.0 * *self.zoom_level.lock().unwrap();
+                            *self.offset.lock().unwrap() = (x, y);
+                            Some(InputAction::ChangeZoomLevel)
+                        } else {
+                            None
+                        }
+                    },
+					KeyCode::Up | KeyCode::Char('k') => {
+                        let (x, mut y) = *self.offset.lock().unwrap();
+                        if y > 0.0 {
+                            y -= 50.0 * *self.zoom_level.lock().unwrap();
+                            *self.offset.lock().unwrap() = (x, y);
+                            Some(InputAction::ChangeZoomLevel)
+                        } else {
+                            None
+                        }
+                    },
 					KeyCode::Esc => match self.bottom_msg {
 						BottomMessage::Input(_) => {
 							self.set_bottom_msg(None);
