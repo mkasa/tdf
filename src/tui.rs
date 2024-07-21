@@ -367,6 +367,10 @@ impl Tui {
 							*page = (*page * 10) + input_num as usize;
 							InputAction::Redraw
 						}),
+					KeyCode::Char('f') =>
+						self.change_page(PageChange::Next, ChangeAmount::Single),
+					KeyCode::Char('b') =>
+						self.change_page(PageChange::Prev, ChangeAmount::Single),
 					KeyCode::Right | KeyCode::Char('l') =>
 						self.change_page(PageChange::Next, ChangeAmount::Single),
 					KeyCode::Down | KeyCode::Char('j') =>
