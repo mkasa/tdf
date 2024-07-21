@@ -58,6 +58,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .short('c')
             .long("center")
             .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("multipage")
+            .help("Multipage mode")
+            .short('m')
+            .long("multipage")
+            .action(clap::ArgAction::SetTrue))
         .arg(Arg::new("page")
             .help("The page to open the document on")
             .short('p')
@@ -65,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .value_parser(clap::value_parser!(usize)))
         .get_matches();
     let should_center = matches.get_flag("center");
+    let multiple_page_mode = matches.get_flag("multipage");
     let file = matches.get_one::<String>("file").expect("specify a pdf");
     let initial_page_num = *matches.get_one::<usize>("page").unwrap_or(&1) - 1;
 	let path = PathBuf::from_str(&file)?.canonicalize()?;
