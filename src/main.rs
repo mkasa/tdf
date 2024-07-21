@@ -3,7 +3,8 @@
 use std::{
 	io::{stdout, Read, Write},
 	path::PathBuf,
-	str::FromStr
+	str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 use converter::{run_conversion_loop, ConvertedPage, ConverterMsg};
@@ -68,10 +69,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .short('p')
             .long("page")
             .value_parser(clap::value_parser!(usize)))
+        .arg(Arg::new("zoom")
+            .help("The zoom level to open the document on")
+            .short('z')
+            .long("zoom")
+            .value_parser(clap::value_parser!(f64)))
         .get_matches();
     let should_center = matches.get_flag("center");
     let multiple_page_mode = matches.get_flag("multipage");
     let file = matches.get_one::<String>("file").expect("specify a pdf");
+    let zoom_level = *matches.get_one::<f64>("zoom").unwrap_or(&1.0);
     let initial_page_num = *matches.get_one::<usize>("page").unwrap_or(&1) - 1;
 	let path = PathBuf::from_str(&file)?.canonicalize()?;
 
@@ -158,8 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// then we want to spawn off the rendering task
 	// We need to use the thread::spawn API so that this exists in a thread not owned by tokio,
 	// since the methods we call in `start_rendering` will panic if called in an async context
+    let zoom_level_shared = Arc::new(Mutex::new(zoom_level));
+    let zoom_level_shared_1 = Arc::clone(&zoom_level_shared);
 	std::thread::spawn(move || {
-		renderer::start_rendering(file_path, render_tx, render_rx, window_size, multiple_page_mode)
+		renderer::start_rendering(file_path, render_tx, render_rx, window_size, zoom_level_shared_1, multiple_page_mode)
 	});
 
 	let mut ev_stream = crossterm::event::EventStream::new();
@@ -174,7 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.map(|n| n.to_string_lossy())
 		.unwrap_or_else(|| "Unknown file".into())
 		.to_string();
-	let mut tui = tui::Tui::new(file_name, should_center, initial_page_num);
+    let zoom_level_shared_2 = Arc::clone(&zoom_level_shared);
+	let mut tui = tui::Tui::new(file_name, should_center, initial_page_num, zoom_level_shared_2, multiple_page_mode);
 
 	let backend = CrosstermBackend::new(std::io::stdout());
 	let mut term = Terminal::new(backend)?;
@@ -211,6 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 						match action {
 							InputAction::Redraw => (),
 							InputAction::QuitApp => break,
+                            InputAction::ChangeZoomLevel => {
+                                tui_tx.send(RenderNotif::ZoomLevelChange)?;
+                            },
 							InputAction::JumpingToPage(page) => {
 								tui_tx.send(RenderNotif::JumpToPage(page))?;
 								to_converter.send(ConverterMsg::GoToPage(page))?;

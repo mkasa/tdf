@@ -15,7 +15,7 @@ pub struct ConvertedPage {
 pub enum ConverterMsg {
 	NumPages(usize),
 	GoToPage(usize),
-	AddImg(PageInfo)
+	AddImg(PageInfo),
 }
 
 pub async fn run_conversion_loop(

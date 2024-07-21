@@ -1,4 +1,9 @@
-use std::thread;
+use std::{
+    thread,
+    sync::{Arc, Mutex},
+    fs::OpenOptions,
+    io::prelude::*,
+};
 
 use cairo::{Antialias, Context, Format, Surface};
 use crossterm::terminal::WindowSize;
@@ -11,6 +16,7 @@ pub enum RenderNotif {
 	Area(Rect),
 	JumpToPage(usize),
 	Search(String),
+    ZoomLevelChange,
 	Reload
 }
 
@@ -46,6 +52,17 @@ struct PrevRender {
 	contained_term: Option<bool>
 }
 
+fn log_message_to_file(msg: String) -> () {
+    let mut file = match OpenOptions::new().create(true).append(true).open("/tmp/zoom_level.txt") {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Couldn't open zoom_level.txt: {}", e);
+            return
+        }
+    };
+    file.write_all(msg.as_bytes());
+}
+
 pub fn fill_default<T: Default>(vec: &mut Vec<T>, size: usize) {
 	vec.clear();
 	vec.reserve(size.saturating_sub(vec.len()));
@@ -68,6 +85,7 @@ pub fn start_rendering(
 	mut sender: Sender<Result<RenderInfo, RenderError>>,
 	receiver: Receiver<RenderNotif>,
 	size: WindowSize,
+    zoom_level: Arc<Mutex<f64>>,
     multipage_mode: bool
 ) -> Result<(), SendError<Result<RenderInfo, RenderError>>> {
 	// first, wait 'til we get told what the current starting area is so that we can set it to
@@ -83,6 +101,8 @@ pub fn start_rendering(
 	// We want this outside of 'reload so that if the doc reloads, the search term that somebody
 	// set will still get highlighted in the reloaded doc
 	let mut search_term = None;
+
+    let mut serial_counter = 0;
 
 	// And although the font size could theoretically change, we aren't accounting for that right
 	// now, so we just keep this out of the loop.
@@ -131,6 +151,10 @@ pub fn start_rendering(
 								continue 'render_pages;
 							}
 						}
+                        RenderNotif::ZoomLevelChange => {
+                            log_message_to_file(format!("Zoom level changed to {}\n",zoom_level.lock().unwrap().clone()));
+                            continue 'reload;
+                        }
 						RenderNotif::JumpToPage(page) => {
 							start_point = page;
 							continue 'render_pages;
@@ -211,13 +235,17 @@ pub fn start_rendering(
 				let rendered_with_no_results =
 					rendered.successful && rendered.contained_term == Some(false);
 
+                serial_counter += 1;
 				// render the page
+                log_message_to_file(format!("Rendering page {} with zl {}, nr {}\n", num, zoom_level.lock().unwrap().clone(), rendered_with_no_results));
 				match render_single_page_to_ctx(
 					page,
 					&search_term,
 					rendered_with_no_results,
 					(area_w, area_h),
-                    multipage_mode
+                    zoom_level.lock().unwrap().clone(),
+                    multipage_mode,
+                    serial_counter
 				) {
 					// If we've already rendered it just fine and we don't need to render it again,
 					// just continue. We're all good
@@ -269,7 +297,8 @@ struct RenderedContext {
 	surface: Surface,
 	num_results: usize,
 	surface_width: f64,
-	surface_height: f64
+	surface_height: f64,
+    index: usize,
 }
 
 /// SAFETY: I think this is safe because, although the backing struct for `Surface` does contain
@@ -290,8 +319,9 @@ fn render_single_page_to_ctx(
 	already_rendered_no_results: bool,
 	(area_w, area_h): (f64, f64),
     // (offset_x, offset_y): (f64, f64),
-    // zoom_level: f64,
-    multipage_mode: bool
+    zoom_level: f64,
+    multipage_mode: bool,
+    serial_counter: usize
 ) -> Result<Option<RenderedContext>, String> {
 	let mut result_rects = search_term
 		.as_ref()
@@ -299,11 +329,11 @@ fn render_single_page_to_ctx(
 		.unwrap_or_default();
 
     let (offset_x, offset_y): (f64, f64) = (150.0, 2.0);
-    let zoom_level: f64 = 2.0;
 
 	// If there are no search terms on this page, and we've already rendered it with no search
 	// terms, then just return none to avoid this computation
 	if result_rects.is_empty() && already_rendered_no_results {
+        log_message_to_file(format!("Avoided\n"));
 		return Ok(None);
 	}
 
@@ -333,6 +363,7 @@ fn render_single_page_to_ctx(
 	let surface_width = p_width * scale_factor;
 	let surface_height = p_height * scale_factor;
     let zoom_factor = if multipage_mode { 1.0 } else { zoom_level };
+    // eprintln!("zoom factor: {}", zoom_factor);
 
 	let surface = cairo::ImageSurface::create(
 		Format::Rgb16_565,
@@ -392,12 +423,15 @@ fn render_single_page_to_ctx(
 		}
 	}
 
-	Ok(Some(RenderedContext {
+    log_message_to_file(format!("Rendered page with counter = {}\n", serial_counter));
+	let rc = RenderedContext {
 		surface: ctx.target(),
 		num_results,
 		surface_width,
-		surface_height
-	}))
+		surface_height,
+        index: serial_counter
+	};
+    Ok(Some(rc))
 }
 
 fn render_ctx_to_png(
@@ -408,6 +442,7 @@ fn render_ctx_to_png(
 ) -> Result<(), SendError<Result<RenderInfo, RenderError>>> {
 	let mut img_data = Vec::with_capacity((ctx.surface_height * ctx.surface_width) as usize);
 
+    log_message_to_file(format!("Writing to png with counter = {}\n", ctx.index));
 	match ctx.surface.write_to_png(&mut img_data) {
 		Err(e) => sender.send(Err(RenderError::Render(format!(
 			"Couldn't write surface to png: {e}"

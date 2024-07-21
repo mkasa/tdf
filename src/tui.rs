@@ -1,4 +1,8 @@
-use std::{io::stdout, rc::Rc};
+use std::{
+    io::stdout,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use crossterm::{
 	event::{Event, KeyCode, MouseEventKind},
@@ -19,7 +23,8 @@ use crate::{renderer::RenderError, skip::Skip};
 pub struct Tui {
 	name: String,
 	page: usize,
-    zoom_level: f64,
+    zoom_level: Arc<Mutex<f64>>,
+    multipage_mode: bool,
     should_center: bool,
 	last_render: LastRender,
 	bottom_msg: BottomMessage,
@@ -66,11 +71,12 @@ struct RenderedInfo {
 }
 
 impl Tui {
-	pub fn new(name: String, should_center: bool, initial_page_num: usize) -> Tui {
+	pub fn new(name: String, should_center: bool, initial_page_num: usize, zoom_level: Arc<Mutex<f64>>, multipage_mode: bool) -> Tui {
 		Self {
 			name,
 			page: initial_page_num,
-            zoom_level: 1.0,
+            zoom_level,
+            multipage_mode,
             should_center,
 			prev_msg: None,
 			bottom_msg: BottomMessage::Help,
@@ -369,21 +375,25 @@ impl Tui {
 							*page = (*page * 10) + input_num as usize;
 							InputAction::Redraw
 						}),
-                    KeyCode::Char('+') => {
-                        if self.zoom_level < 16.0 {
-                            self.zoom_level *= 2.0;
+                    KeyCode::Char('o') => {
+                        let current_zoom_level = self.zoom_level.lock().unwrap().clone();
+                        if current_zoom_level < 16.0 {
+                            *self.zoom_level.lock().unwrap() *= 2.0;
                         }
-                        Some(InputAction::Redraw)
+                        self.last_render.rect = Rect::default();
+                        Some(InputAction::ChangeZoomLevel)
                     },
-                    KeyCode::Char('-') => {
-                        if self.zoom_level > 1.0 {
-                            self.zoom_level /= 2.0;
+                    KeyCode::Char('p') => {
+                        let current_zoom_level = self.zoom_level.lock().unwrap().clone();
+                        if current_zoom_level > 1.0 {
+                            *self.zoom_level.lock().unwrap() /= 2.0;
                         }
-                        Some(InputAction::Redraw)
+                        self.last_render.rect = Rect::default();
+                        Some(InputAction::ChangeZoomLevel)
                     },
-					KeyCode::Char('f') =>
+					KeyCode::PageDown | KeyCode::Char('f') =>
 						self.change_page(PageChange::Next, ChangeAmount::Single),
-					KeyCode::Char('b') =>
+					KeyCode::PageUp | KeyCode::Char('b') =>
 						self.change_page(PageChange::Prev, ChangeAmount::Single),
 					KeyCode::Right | KeyCode::Char('l') =>
 						self.change_page(PageChange::Next, ChangeAmount::Single),
@@ -544,6 +554,7 @@ pub enum InputAction {
 	Redraw,
 	JumpingToPage(usize),
 	Search(String),
+    ChangeZoomLevel,
 	QuitApp
 }
 

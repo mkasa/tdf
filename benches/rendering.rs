@@ -3,7 +3,8 @@ mod utils;
 use std::{
 	hint::black_box,
 	path::Path,
-	time::{SystemTime, UNIX_EPOCH}
+	time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
 };
 
 use criterion::{criterion_group, criterion_main, profiler::Profiler, BenchmarkId, Criterion};
@@ -27,7 +28,7 @@ fn render_full(c: &mut Criterion) {
 	for file in FILES {
 		c.bench_with_input(BenchmarkId::new("render_full", file), &file, |b, &file| {
 			b.to_async(tokio::runtime::Runtime::new().unwrap())
-				.iter(|| render_doc(file))
+				.iter(|| render_doc(file, Arc::new(Mutex::new(1.0)), false))
 		});
 	}
 }
@@ -39,7 +40,7 @@ fn render_to_first_page(c: &mut Criterion) {
 			&file,
 			|b, &file| {
 				b.to_async(tokio::runtime::Runtime::new().unwrap())
-					.iter(|| render_first_page(file))
+					.iter(|| render_first_page(file, Arc::new(Mutex::new(1.0)), false))
 			}
 		);
 	}
@@ -61,14 +62,14 @@ fn only_converting(c: &mut Criterion) {
 	}
 }
 
-pub async fn render_first_page(path: impl AsRef<Path>) {
+pub async fn render_first_page(path: impl AsRef<Path>, zoom_level: Arc<Mutex<f64>>, multiple_page_mode: bool) {
 	let RenderState {
 		mut from_render_rx,
 		mut from_converter_rx,
 		mut pages,
 		mut to_converter_tx,
 		to_render_tx
-	} = start_all_rendering(path);
+	} = start_all_rendering(path, zoom_level, multiple_page_mode);
 
 	// we only want to render until the first page is ready to be printed
 	while pages.iter().all(|p| p.is_none()) {
@@ -89,7 +90,8 @@ pub async fn render_first_page(path: impl AsRef<Path>) {
 }
 
 async fn render_all_files(path: &'static str) -> Vec<PageInfo> {
-	let (mut from_render_rx, to_render_tx) = start_rendering_loop(path);
+    let zoom_level = Arc::new(Mutex::new(1.0));
+	let (mut from_render_rx, to_render_tx) = start_rendering_loop(path, zoom_level, false);
 	let mut pages = Vec::<Option<PageInfo>>::new();
 
 	while let Some(info) = from_render_rx.next().await {
