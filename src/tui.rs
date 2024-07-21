@@ -99,7 +99,6 @@ impl Tui {
 
 	// TODO: Make a way to fill the width of the screen with one page and scroll down to view it
 	pub fn render(&mut self, frame: &mut Frame<'_>, main_area: &[Rect]) {
-        let multipage_mode = false;
 		let top_block = Block::new()
 			.padding(Padding {
 				right: 2,
@@ -110,7 +109,8 @@ impl Tui {
 
 		let top_area = top_block.inner(main_area[0]);
 
-		let page_nums_text = format!("{} / {}", self.page + 1, self.rendered.len());
+		let page_nums_text = format!("{} {} / {} @ {}%", if self.multipage_mode {"Multi "} else {"Single"}, self.page + 1, self.rendered.len(), self.zoom_level.lock().unwrap().clone() * 100.0);
+		// let page_nums_text = format!("{} / {}", self.page + 1, self.rendered.len());
 
 		let top_layout = Layout::horizontal([
 			Constraint::Fill(1),
@@ -207,7 +207,7 @@ impl Tui {
 			// here we calculate how many pages can fit in the available area.
 			let mut test_area_w = img_area.width;
 			// go through our pages, starting at the first one we want to view
-			let page_widths = self.rendered[self.page..if multipage_mode {self.rendered.len()} else {self.page + 1}]
+			let page_widths = self.rendered[self.page..if self.multipage_mode {self.rendered.len()} else {self.page + 1}]
 				.iter()
 				// and get their indices (I know it's offset, we fix it down below when we actually
 				// render each page)
