@@ -55,7 +55,8 @@ pub struct RenderState {
 const FONT_SIZE: (u16, u16) = (8, 14);
 
 pub fn start_rendering_loop(
-	path: impl AsRef<Path>
+	path: impl AsRef<Path>,
+    multipage_mode: bool
 ) -> (
 	RecvStream<'static, Result<RenderInfo, RenderError>>,
 	Sender<RenderNotif>
@@ -75,7 +76,7 @@ pub fn start_rendering_loop(
 		width: columns * FONT_SIZE.0
 	};
 
-	std::thread::spawn(move || start_rendering(str_path, to_main_tx, from_main_rx, size));
+	std::thread::spawn(move || start_rendering(str_path, to_main_tx, from_main_rx, size, multipage_mode));
 
 	let main_area = Rect {
 		x: 0,
@@ -112,8 +113,8 @@ pub fn start_converting_loop(
 	(from_converter_rx, to_converter_tx)
 }
 
-pub fn start_all_rendering(path: impl AsRef<Path>) -> RenderState {
-	let (from_render_rx, to_render_tx) = start_rendering_loop(path);
+pub fn start_all_rendering(path: impl AsRef<Path>, multipage_mode: bool) -> RenderState {
+	let (from_render_rx, to_render_tx) = start_rendering_loop(path, multipage_mode);
 	let (from_converter_rx, to_converter_tx) = start_converting_loop(20);
 
 	let pages: Vec<Option<ConvertedPage>> = Vec::new();
@@ -127,14 +128,14 @@ pub fn start_all_rendering(path: impl AsRef<Path>) -> RenderState {
 	}
 }
 
-pub async fn render_doc(path: impl AsRef<Path>) {
+pub async fn render_doc(path: impl AsRef<Path>, multipage_mode: bool) {
 	let RenderState {
 		mut from_render_rx,
 		mut from_converter_rx,
 		mut pages,
 		mut to_converter_tx,
 		to_render_tx
-	} = start_all_rendering(path);
+	} = start_all_rendering(path, multipage_mode);
 
 	while pages.is_empty() || pages.iter().any(|p| p.is_none()) {
 		tokio::select! {

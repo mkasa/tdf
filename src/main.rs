@@ -159,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	// We need to use the thread::spawn API so that this exists in a thread not owned by tokio,
 	// since the methods we call in `start_rendering` will panic if called in an async context
 	std::thread::spawn(move || {
-		renderer::start_rendering(file_path, render_tx, render_rx, window_size)
+		renderer::start_rendering(file_path, render_tx, render_rx, window_size, multiple_page_mode)
 	});
 
 	let mut ev_stream = crossterm::event::EventStream::new();
