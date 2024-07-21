@@ -379,17 +379,19 @@ impl Tui {
                         let current_zoom_level = self.zoom_level.lock().unwrap().clone();
                         if current_zoom_level < 16.0 {
                             *self.zoom_level.lock().unwrap() *= 2.0;
+                            Some(InputAction::ChangeZoomLevel)
+                        } else {
+                            None
                         }
-                        self.last_render.rect = Rect::default();
-                        Some(InputAction::ChangeZoomLevel)
                     },
                     KeyCode::Char('p') => {
                         let current_zoom_level = self.zoom_level.lock().unwrap().clone();
                         if current_zoom_level > 1.0 {
                             *self.zoom_level.lock().unwrap() /= 2.0;
+                            Some(InputAction::ChangeZoomLevel)
+                        } else {
+                            None
                         }
-                        self.last_render.rect = Rect::default();
-                        Some(InputAction::ChangeZoomLevel)
                     },
 					KeyCode::PageDown | KeyCode::Char('f') =>
 						self.change_page(PageChange::Next, ChangeAmount::Single),
