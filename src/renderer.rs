@@ -397,15 +397,15 @@ fn render_single_page_to_ctx(
 
 	// The default background color of PDFs (at least, I think) is white, so we need to set
 	// that as the background color, then paint, then render.
-	// ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-	ctx.set_source_rgba(0.0, 0.0, 0.0, 1.0);
-
+	ctx.set_source_rgba(0.2, 0.2, 0.2, 1.0);
 	ctx.set_antialias(Antialias::None);
-	// ctx.set_antialias(Antialias::Fast);
 	ctx.paint()
 		.map_err(|e| format!("Couldn't paint Context: {e}"))?;
 
     ctx.translate(-offset_x, -offset_y);
+	ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    ctx.rectangle(0.0, 0.0, p_width, p_height);
+    ctx.fill().map_err(|e| format!("Couldn't fill Context: {e}"))?;
     ctx.rectangle(offset_x, offset_y, p_real_width / zoom_factor, p_height / zoom_factor);
     ctx.clip();
 
