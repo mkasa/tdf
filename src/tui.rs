@@ -344,7 +344,9 @@ impl Tui {
 				columns: img_area.width,
 				rows: img_area.height,
 				..DisplayLocation::default()
-			}
+			},
+			cell_w: img_area.width,
+			cell_h: img_area.height
 		}])
 	}
 
@@ -480,11 +482,13 @@ impl Tui {
 					let maybe_img =
 						Self::render_single_page(frame, img, Rect { width, ..img_area });
 					img_area.x += width;
-					maybe_img.map(|(img, pos)| KittyReadyToDisplay {
+					maybe_img.map(|(img, pos, cw, ch)| KittyReadyToDisplay {
 						img,
 						page_num: idx + self.page,
 						pos,
-						display_loc: DisplayLocation::default()
+						display_loc: DisplayLocation::default(),
+						cell_w: cw,
+						cell_h: ch
 					})
 				})
 				.collect::<Vec<_>>();
@@ -501,7 +505,7 @@ impl Tui {
 		frame: &mut Frame<'_>,
 		page_img: &'img mut ConvertedImage,
 		img_area: Rect
-	) -> Option<(&'img mut MaybeTransferred, Position)> {
+	) -> Option<(&'img mut MaybeTransferred, Position, u16, u16)> {
 		match page_img {
 			ConvertedImage::Generic(page_img) => {
 				frame.render_widget(Image::new(page_img), img_area);
@@ -509,12 +513,12 @@ impl Tui {
 			}
 			ConvertedImage::Kitty {
 				img,
-				cell_h: _,
-				cell_w: _
+				cell_h,
+				cell_w
 			} => Some((img, Position {
 				x: img_area.x,
 				y: img_area.y
-			}))
+			}, *cell_w, *cell_h))
 		}
 	}
 
