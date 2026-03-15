@@ -392,6 +392,17 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		)
 	})?;
 
+	// Delete all Kitty images from the underlying terminal via DCS passthrough on exit,
+	// since LeaveAlternateScreen only affects tmux's virtual terminal
+	if tmux_offset.is_some() {
+		let mut stdout = std::io::stdout().lock();
+		// \x1b_Ga=d,d=A\x1b\\ (delete all) wrapped in DCS passthrough with ESC doubled
+		stdout
+			.write_all(b"\x1bPtmux;\x1b\x1b_Ga=d,d=A\x1b\x1b\\\x1b\\")
+			.unwrap();
+		stdout.flush().unwrap();
+	}
+
 	drop(maybe_logger);
 	Ok(())
 }
