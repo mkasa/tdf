@@ -8,6 +8,7 @@ use crossterm::{
 		enable_raw_mode
 	}
 };
+use image::DynamicImage;
 use kittage::display::DisplayLocation;
 use ratatui::{
 	Frame,
@@ -18,10 +19,9 @@ use ratatui::{
 	text::Span,
 	widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap}
 };
-use ratatui_image::{FontSize, Image};
+use ratatui_image::{FontSize, Image, protocol::{Protocol, iterm2::Iterm2}};
 
 use crate::{
-	FitOrFill,
 	converter::{ConvertedImage, MaybeTransferred},
 	kitty::{KittyDisplay, KittyReadyToDisplay},
 	renderer::{RenderError, fill_default},
@@ -40,7 +40,7 @@ pub struct Tui {
 	page_constraints: PageConstraints,
 	showing_help_msg: bool,
 	is_kitty: bool,
-	tmux_placeholders: bool,
+	render_generation: u64,
 	zoom: Option<Zoom>
 }
 
@@ -190,8 +190,7 @@ impl Tui {
 		name: String,
 		max_wide: Option<NonZeroUsize>,
 		r_to_l: bool,
-		is_kitty: bool,
-		tmux_placeholders: bool
+		is_kitty: bool
 	) -> Self {
 		Self {
 			name,
@@ -203,7 +202,7 @@ impl Tui {
 			page_constraints: PageConstraints { max_wide, r_to_l },
 			showing_help_msg: false,
 			is_kitty,
-			tmux_placeholders,
+			render_generation: 0,
 			zoom: None
 		}
 	}
@@ -240,35 +239,28 @@ impl Tui {
 		zoom: &mut Zoom,
 		img: &'s mut MaybeTransferred,
 		page_num: usize,
+		img_px_w: u32,
+		img_px_h: u32,
 		img_cell_w: u16,
 		img_cell_h: u16
 	) -> KittyDisplay<'s> {
 		log::debug!("zoom is {zoom:#?}");
 		log::debug!("page area is {img_area:#?}");
-		log::debug!("img dimensions are {img_cell_w}x{img_cell_h}");
-
-		// Dimensions of the section of the image to be displayed.
-		// Kittage calls this the "image area to display".
-		// We need to shrink this or the page area in order to zoom in or out,
-		// respectively.
-		let mut img_section_w = f32::from(img_cell_w);
-		let mut img_section_h = f32::from(img_cell_h);
+		log::debug!("img dimensions are {img_px_w}x{img_px_h} px, {img_cell_w}x{img_cell_h} cells");
 
 		let zoom_factor = zoom.factor();
+		let mut crop_w = img_px_w as f32;
+		let mut crop_h = img_px_h as f32;
 
-		if zoom_factor >= 1.0 {
-			// Use a smaller section of the image. This efficively zooms into that section.
-			img_section_w /= zoom_factor;
-			img_section_h /= zoom_factor;
-		} else {
+		if zoom_factor < 1.0 {
 			// Shrink the page area, such that the fill-screen conversion
 			// will zoom out of the image.
 			let initial_page_w = f32::from(img_area.width);
 			let initial_page_h = f32::from(img_area.height);
 
 			// how many pages the image is wide/high
-			let img_page_w_ratio = img_section_w / initial_page_w;
-			let img_page_h_ratio = img_section_h / initial_page_h;
+			let img_page_w_ratio = f32::from(img_cell_w) / initial_page_w;
+			let img_page_h_ratio = f32::from(img_cell_h) / initial_page_h;
 
 			let shrink_move_page = |dim: &mut u16, pos: &mut u16, axis_zoom_factor: f32| {
 				let old_dim = *dim;
@@ -301,41 +293,32 @@ impl Tui {
 				);
 			}
 		}
-		log::debug!("after adjustment, page area is {img_area:#?}");
+		let target_px_w = f32::from(img_area.width) * f32::from(font_size.0);
+		let target_px_h = f32::from(img_area.height) * f32::from(font_size.1);
+		let target_aspect = target_px_w / target_px_h;
 
-		// Crop the image such that in the end, the aspect ratio of the section
-		// is the same as that of the page area. This effectively performs the
-		// conversion to fill-screen.
-		// Note that this only works because cell_w, cell_h is in fit-screen
-		// format, i.e. the cell size and the page area already share at
-		// least one dimension.
-		{
-			let page_area_w = f32::from(img_area.width);
-			let page_area_h = f32::from(img_area.height);
-
-			// how many pages the image is wide/high
-			// Note that this is not the same as during the
-			// zoom-out calculation, since it changed the page
-			// dimensions.
-			let img_page_w_ratio = img_section_w / page_area_w;
-			let img_page_h_ratio = img_section_h / page_area_h;
-
-			if img_page_w_ratio < img_page_h_ratio {
-				img_section_h = page_area_h * img_page_w_ratio;
-			} else {
-				img_section_w = page_area_w * img_page_h_ratio;
-			}
+		if zoom_factor >= 1.0 {
+			crop_w /= zoom_factor;
+			crop_h /= zoom_factor;
 		}
 
-		let width = (img_section_w * f32::from(font_size.0)) as u32;
-		let height = (img_section_h * f32::from(font_size.1)) as u32;
+		let px_per_cell_w = img_px_w as f32 / f32::from(img_cell_w.max(1));
+		let px_per_cell_h = img_px_h as f32 / f32::from(img_cell_h.max(1));
+		let crop_aspect = crop_w / crop_h;
+		if crop_aspect > target_aspect {
+			crop_w = crop_h * target_aspect;
+		} else {
+			crop_h = crop_w / target_aspect;
+		}
 
-		zoom.cell_pan_from_left = zoom
-			.cell_pan_from_left
-			.min(img_cell_w.saturating_sub(img_section_w.ceil() as u16));
-		zoom.cell_pan_from_top = zoom
-			.cell_pan_from_top
-			.min(img_cell_h.saturating_sub(img_section_h.ceil() as u16));
+		let max_pan_left_px = (img_px_w as f32 - crop_w).max(0.0);
+		let max_pan_top_px = (img_px_h as f32 - crop_h).max(0.0);
+		let max_pan_left_cells = (max_pan_left_px / px_per_cell_w).floor() as u16;
+		let max_pan_top_cells = (max_pan_top_px / px_per_cell_h).floor() as u16;
+		zoom.cell_pan_from_left = zoom.cell_pan_from_left.min(max_pan_left_cells);
+		zoom.cell_pan_from_top = zoom.cell_pan_from_top.min(max_pan_top_cells);
+
+		log::debug!("after adjustment, page area is {img_area:#?}");
 
 		KittyDisplay::DisplayImages(vec![KittyReadyToDisplay {
 			img,
@@ -345,10 +328,10 @@ impl Tui {
 				y: img_area.y
 			},
 			display_loc: DisplayLocation {
-				x: u32::from(zoom.cell_pan_from_left) * u32::from(font_size.0),
-				y: u32::from(zoom.cell_pan_from_top) * u32::from(font_size.1),
-				width,
-				height,
+				x: (f32::from(zoom.cell_pan_from_left) * px_per_cell_w).round() as u32,
+				y: (f32::from(zoom.cell_pan_from_top) * px_per_cell_h).round() as u32,
+				width: crop_w.round() as u32,
+				height: crop_h.round() as u32,
 				columns: img_area.width,
 				rows: img_area.height,
 				..DisplayLocation::default()
@@ -356,6 +339,97 @@ impl Tui {
 			cell_w: img_area.width,
 			cell_h: img_area.height,
 		}])
+	}
+
+	fn render_zoomed_generic(
+		frame: &mut Frame<'_>,
+		mut img_area: Rect,
+		font_size: FontSize,
+		zoom: &mut Zoom,
+		protocol: &mut Protocol,
+		source: &DynamicImage
+	) {
+		let zoom_factor = zoom.factor();
+		let source_px_w = source.width() as f32;
+		let source_px_h = source.height() as f32;
+		let source_cells = protocol.area();
+		let source_cell_w = source_cells.width.max(1);
+		let source_cell_h = source_cells.height.max(1);
+
+		if zoom_factor < 1.0 {
+			let initial_page_w = f32::from(img_area.width);
+			let initial_page_h = f32::from(img_area.height);
+			let img_page_w_ratio = f32::from(source_cell_w) / initial_page_w;
+			let img_page_h_ratio = f32::from(source_cell_h) / initial_page_h;
+
+			let shrink_move_page = |dim: &mut u16, pos: &mut u16, axis_zoom_factor: f32| {
+				let old_dim = *dim;
+				*dim = (f32::from(*dim) * axis_zoom_factor) as u16;
+				*pos += old_dim
+					.checked_sub(*dim)
+					.expect("zooming out should shrink the image")
+					/ 2;
+			};
+
+			if img_page_w_ratio < img_page_h_ratio {
+				shrink_move_page(
+					&mut img_area.width,
+					&mut img_area.x,
+					zoom_factor.max(1.0 / img_page_h_ratio)
+				);
+			} else {
+				shrink_move_page(
+					&mut img_area.height,
+					&mut img_area.y,
+					zoom_factor.max(1.0 / img_page_w_ratio)
+				);
+			}
+		}
+
+		let target_px_w = f32::from(img_area.width) * f32::from(font_size.0);
+		let target_px_h = f32::from(img_area.height) * f32::from(font_size.1);
+		let target_aspect = target_px_w / target_px_h;
+
+		let mut crop_w = source_px_w;
+		let mut crop_h = source_px_h;
+		if zoom_factor >= 1.0 {
+			crop_w /= zoom_factor;
+			crop_h /= zoom_factor;
+		}
+
+		let crop_aspect = crop_w / crop_h;
+		if crop_aspect > target_aspect {
+			crop_w = crop_h * target_aspect;
+		} else {
+			crop_h = crop_w / target_aspect;
+		}
+
+		let px_per_cell_w = source_px_w / f32::from(source_cell_w);
+		let px_per_cell_h = source_px_h / f32::from(source_cell_h);
+		let max_pan_left_px = (source_px_w - crop_w).max(0.0);
+		let max_pan_top_px = (source_px_h - crop_h).max(0.0);
+		let max_pan_left_cells = (max_pan_left_px / px_per_cell_w).floor() as u16;
+		let max_pan_top_cells = (max_pan_top_px / px_per_cell_h).floor() as u16;
+		zoom.cell_pan_from_left = zoom.cell_pan_from_left.min(max_pan_left_cells);
+		zoom.cell_pan_from_top = zoom.cell_pan_from_top.min(max_pan_top_cells);
+
+		let crop_x = (f32::from(zoom.cell_pan_from_left) * px_per_cell_w).round() as u32;
+		let crop_y = (f32::from(zoom.cell_pan_from_top) * px_per_cell_h).round() as u32;
+		let crop_w = crop_w.round() as u32;
+		let crop_h = crop_h.round() as u32;
+		let cropped = source.crop_imm(crop_x, crop_y, crop_w, crop_h);
+		let resized = cropped.resize_exact(
+			target_px_w.max(1.0).round() as u32,
+			target_px_h.max(1.0).round() as u32,
+			image::imageops::FilterType::Triangle
+		);
+
+		let is_tmux = matches!(protocol, Protocol::ITerm2(iterm) if iterm.is_tmux);
+		*protocol = Protocol::ITerm2(
+			Iterm2::new(resized, Rect::new(0, 0, img_area.width, img_area.height), is_tmux)
+				.expect("iTerm2 zoom protocol generation should succeed")
+		);
+		frame.render_widget(Image::new(protocol), img_area);
 	}
 
 	#[must_use]
@@ -407,6 +481,8 @@ impl Tui {
 			{
 				let Some(ConvertedImage::Kitty {
 					ref mut img,
+					px_w,
+					px_h,
 					cell_w,
 					cell_h
 				}) = self.rendered[self.page].img
@@ -420,8 +496,21 @@ impl Tui {
 					unused_width: 0
 				};
 				return Self::render_zoomed(
-					img_area, font_size, zoom, img, self.page, cell_w, cell_h
+					img_area, font_size, zoom, img, self.page, px_w, px_h, cell_w, cell_h
 				);
+			}
+			if let Some(ConvertedImage::Generic {
+				protocol,
+				source
+			}) = self.rendered[self.page].img.as_mut()
+			{
+				self.last_render = LastRender {
+					rect: size,
+					pages_shown: 1,
+					unused_width: 0
+				};
+				Self::render_zoomed_generic(frame, img_area, font_size, zoom, protocol, source);
+				return KittyDisplay::NoChange;
 			}
 		}
 
@@ -515,12 +604,17 @@ impl Tui {
 		img_area: Rect
 	) -> Option<(&'img mut MaybeTransferred, Position, u16, u16)> {
 		match page_img {
-			ConvertedImage::Generic(page_img) => {
+			ConvertedImage::Generic {
+				protocol: page_img,
+				source: _
+			} => {
 				frame.render_widget(Image::new(page_img), img_area);
 				None
 			}
 			ConvertedImage::Kitty {
 				img,
+				px_w: _,
+				px_h: _,
 				cell_h,
 				cell_w
 			} => Some((img, Position {
@@ -579,7 +673,17 @@ impl Tui {
 		self.page = self.page.min(n_pages - 1);
 	}
 
-	pub fn page_ready(&mut self, img: ConvertedImage, page_num: usize, num_results: usize) {
+	pub fn page_ready(
+		&mut self,
+		img: ConvertedImage,
+		page_num: usize,
+		generation: u64,
+		num_results: usize
+	) {
+		if generation != self.render_generation {
+			return;
+		}
+
 		// If this new image woulda fit within the available space on the last render AND it's
 		// within the range where it might've been rendered with the last shown pages, then reset
 		// the last rect marker so that all images are forced to redraw on next render and this one
@@ -708,7 +812,7 @@ impl Tui {
 			InputAction::JumpingToPage(new_page)
 		}
 
-		let can_zoom = self.is_kitty && !self.tmux_placeholders && self.zoom.is_some();
+		let can_zoom = self.zoom.is_some();
 
 		match ev {
 			Event::Key(key) => {
@@ -833,14 +937,13 @@ impl Tui {
 								self.last_render.rect = Rect::default();
 								Some(InputAction::Redraw)
 							}
-							'z' if self.is_kitty && !self.tmux_placeholders => {
-								let (zoom, f_or_f) = match self.zoom {
-									None => (Some(Zoom::default()), FitOrFill::Fill),
-									Some(_) => (None, FitOrFill::Fit)
+							'z' => {
+								self.zoom = match self.zoom {
+									None => Some(Zoom::default()),
+									Some(_) => None
 								};
-								self.zoom = zoom;
 								self.last_render.rect = Rect::default();
-								Some(InputAction::SwitchRenderZoom(f_or_f))
+								Some(InputAction::Redraw)
 							}
 							'o' if can_zoom => self.update_zoom(Zoom::step_in),
 							'O' if can_zoom => self.update_zoom(Zoom::step_out),

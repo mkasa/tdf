@@ -28,9 +28,14 @@ pub enum MaybeTransferred {
 
 #[derive(Debug)]
 pub enum ConvertedImage {
-	Generic(Protocol),
+	Generic {
+		protocol: Protocol,
+		source: DynamicImage
+	},
 	Kitty {
 		img: MaybeTransferred,
+		px_w: u32,
+		px_h: u32,
 		cell_w: u16,
 		cell_h: u16
 	}
@@ -40,12 +45,17 @@ impl ConvertedImage {
 	#[must_use]
 	pub fn w_h(&self) -> (u16, u16) {
 		match self {
-			Self::Generic(prot) => {
+			Self::Generic {
+				protocol: prot,
+				source: _
+			} => {
 				let a = prot.area();
 				(a.width, a.height)
 			}
 			Self::Kitty {
 				img: _,
+				px_w: _,
+				px_h: _,
 				cell_w,
 				cell_h
 			} => (*cell_w, *cell_h)
@@ -56,6 +66,7 @@ impl ConvertedImage {
 pub struct ConvertedPage {
 	pub page: ConvertedImage,
 	pub num: usize,
+	pub generation: u64,
 	pub num_results: usize
 }
 
@@ -161,19 +172,25 @@ pub async fn run_conversion_loop(
 
 				ConvertedImage::Kitty {
 					img: MaybeTransferred::NotYet(img),
+					px_w: page_info.img_data.px_w,
+					px_h: page_info.img_data.px_h,
 					cell_w: page_info.img_data.cell_w,
 					cell_h: page_info.img_data.cell_h
 				}
 			}
-			_ => ConvertedImage::Generic(
-				picker
-					.new_protocol(dyn_img, img_area, Resize::None)
+			_ => {
+				let protocol = picker
+					.new_protocol(dyn_img.clone(), img_area, Resize::None)
 					.map_err(|e| {
 						RenderError::Converting(format!(
 							"Couldn't convert DynamicImage to ratatui image: {e}"
 						))
-					})?
-			)
+					})?;
+				ConvertedImage::Generic {
+					protocol,
+					source: dyn_img
+				}
+			}
 		};
 
 		log::debug!(
@@ -188,6 +205,7 @@ pub async fn run_conversion_loop(
 		Ok(Some(ConvertedPage {
 			page: txt_img,
 			num: page_info.page_num,
+			generation: page_info.generation,
 			num_results: page_info.result_rects.len()
 		}))
 	}

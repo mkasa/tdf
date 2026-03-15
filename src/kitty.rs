@@ -258,6 +258,24 @@ fn write_unicode_placeholders(
 	stdout.flush()
 }
 
+fn tmux_display_config(display_loc: DisplayLocation, cell_w: u16, cell_h: u16) -> DisplayConfig {
+	let mut config = DisplayConfig {
+		location: display_loc,
+		cursor_movement: CursorMovementPolicy::DontMove,
+		create_virtual_placement: true,
+		..DisplayConfig::default()
+	};
+
+	if config.location.columns == 0 {
+		config.location.columns = cell_w;
+	}
+	if config.location.rows == 0 {
+		config.location.rows = cell_h;
+	}
+
+	config
+}
+
 pub async fn display_kitty_images<'es>(
 	display: KittyDisplay<'_>,
 	ev_stream: &'es mut EventStream,
@@ -274,7 +292,6 @@ pub async fn display_kitty_images<'es>(
 		KittyDisplay::NoChange => return Ok(()),
 		KittyDisplay::DisplayImages(_) | KittyDisplay::ClearImages => {
 			if tmux_offset.is_none() {
-				// Non-tmux: clear previous images via Kitty protocol
 				run_action(
 					Action::Delete(DeleteConfig {
 						effect: ClearOrDelete::Clear,
@@ -286,8 +303,6 @@ pub async fn display_kitty_images<'es>(
 				.await
 				.map_err(|e| (vec![], "Couldn't clear previous images", e))?;
 			}
-			// In tmux placeholder mode, ratatui already overwrites the placeholder cells
-			// with spaces on redraw, so no explicit clear is needed.
 
 			let KittyDisplay::DisplayImages(images) = display else {
 				return Ok(());
@@ -298,26 +313,19 @@ pub async fn display_kitty_images<'es>(
 	};
 
 	if tmux_offset.is_some() {
-		// ---- TMUX UNICODE PLACEHOLDER PATH ----
-		// Diacritics are always 1:1 with display cells; zoom is not supported in tmux.
 		let mut err = None;
 		for KittyReadyToDisplay {
 			img,
 			page_num,
 			pos,
+			display_loc,
 			cell_w,
 			cell_h,
-			..
 		} in images
 		{
+			let config = tmux_display_config(display_loc, cell_w, cell_h);
 			let image_id = match img {
 				MaybeTransferred::NotYet(image) => {
-					let config = DisplayConfig {
-						create_virtual_placement: true,
-						location: DisplayLocation::default(),
-						cursor_movement: CursorMovementPolicy::DontMove,
-						..DisplayConfig::default()
-					};
 					let mut fake_image = Image {
 						num_or_id: image.num_or_id,
 						format: PixelFormat::Rgb24(
@@ -362,7 +370,27 @@ pub async fn display_kitty_images<'es>(
 						}
 					}
 				}
-				MaybeTransferred::Transferred(image_id) => *image_id
+				MaybeTransferred::Transferred(image_id) => {
+					let res = run_action(
+						Action::Display {
+							image_id: *image_id,
+							placement_id: *image_id,
+							config
+						},
+						ev_stream,
+						tmux_offset
+					)
+					.await;
+
+					match res {
+						Ok(_) => *image_id,
+						Err(e) => {
+							let e = err.get_or_insert_with(|| (vec![], e));
+							e.0.push(page_num);
+							continue;
+						}
+					}
+				}
 			};
 
 			write_unicode_placeholders(
@@ -376,14 +404,11 @@ pub async fn display_kitty_images<'es>(
 		}
 
 		return match err {
-			Some((replace, e)) => {
-				Err((replace, "Couldn't transfer image to the terminal", e))
-			}
+			Some((replace, e)) => Err((replace, "Couldn't transfer image to the terminal", e)),
 			None => Ok(())
 		};
 	}
 
-	// ---- NON-TMUX KITTY PATH ----
 	let mut err = None;
 	for KittyReadyToDisplay {
 		img,
@@ -424,7 +449,7 @@ pub async fn display_kitty_images<'es>(
 						placement_id: None
 					},
 					ev_stream,
-					None,
+					tmux_offset,
 					pos
 				)
 				.await;
@@ -439,15 +464,15 @@ pub async fn display_kitty_images<'es>(
 			}
 			MaybeTransferred::Transferred(image_id) => run_action_at(
 				Action::Display {
-					image_id: *image_id,
-					placement_id: *image_id,
-					config
-				},
-				ev_stream,
-				None,
-				pos
-			)
-			.await
+				image_id: *image_id,
+				placement_id: *image_id,
+				config
+			},
+			ev_stream,
+			tmux_offset,
+			pos
+		)
+		.await
 			.map(|_| ())
 			.map_err(|e| (page_num, e))
 		};

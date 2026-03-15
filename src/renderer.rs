@@ -50,12 +50,15 @@ pub enum RotateDirection {
 pub struct PageInfo {
 	pub img_data: ImageData,
 	pub page_num: usize,
+	pub generation: u64,
 	pub result_rects: Vec<HighlightRect>
 }
 
 #[derive(Clone)]
 pub struct ImageData {
 	pub pixels: Vec<u8>,
+	pub px_w: u32,
+	pub px_h: u32,
 	pub cell_w: u16,
 	pub cell_h: u16
 }
@@ -110,6 +113,7 @@ pub fn start_rendering(
 	let mut rotate = RotateDirection::Deg0;
 	let mut preserved_area = None;
 	let mut fit_or_fill = FitOrFill::Fit;
+	let mut generation = 0_u64;
 
 	let mut need_rerender = VecDeque::new();
 
@@ -206,6 +210,7 @@ pub fn start_rendering(
 						RenderNotif::Reload => continue 'reload,
 						RenderNotif::Invert => {
 							invert = !invert;
+							generation = generation.saturating_add(1);
 							for page in &mut rendered {
 								page.successful = false;
 							}
@@ -213,12 +218,14 @@ pub fn start_rendering(
 						}
 						RenderNotif::Area(new_area) => {
 							preserved_area = Some(new_area);
+							generation = generation.saturating_add(1);
 							fill_default(&mut rendered, n_pages.get());
 							continue 'render_pages;
 						}
 						RenderNotif::SwitchFitOrFill(f_or_f) =>
 							if f_or_f != fit_or_fill {
 								fit_or_fill = f_or_f;
+								generation = generation.saturating_add(1);
 								fill_default(&mut rendered, n_pages.get());
 								continue 'render_pages;
 							},
@@ -262,6 +269,7 @@ pub fn start_rendering(
 								RotateDirection::Deg180 => RotateDirection::Deg270,
 								RotateDirection::Deg270 => RotateDirection::Deg0
 							};
+							generation = generation.saturating_add(1);
 							for page in &mut rendered {
 								page.successful = false;
 							}
@@ -353,10 +361,13 @@ pub fn start_rendering(
 						sender.send(Ok(RenderInfo::Page(PageInfo {
 							img_data: ImageData {
 								pixels,
+								px_w: w,
+								px_h: h,
 								cell_w: (ctx.surface_w / f32::from(col_w)) as u16,
 								cell_h: (ctx.surface_h / f32::from(col_h)) as u16
 							},
 							page_num,
+							generation,
 							result_rects: ctx.result_rects
 						})))?;
 					}

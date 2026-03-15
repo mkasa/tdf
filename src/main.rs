@@ -15,6 +15,7 @@ use std::{
 use crossterm::{
 	event::EventStream,
 	execute,
+	event::{DisableFocusChange, EnableFocusChange},
 	terminal::{
 		EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
 		enable_raw_mode, window_size
@@ -66,8 +67,41 @@ fn reset_term() {
 		std::io::stdout(),
 		LeaveAlternateScreen,
 		crossterm::cursor::Show,
-		crossterm::event::DisableMouseCapture
+		crossterm::event::DisableMouseCapture,
+		DisableFocusChange
 	);
+}
+
+async fn clear_kitty_images(
+	ev_stream: &mut EventStream,
+	tmux_offset: Option<(u16, u16)>
+) -> Result<(), TransmitError<<&mut EventStream as kittage::AsyncInputReader>::Error>> {
+	run_action(
+		Action::Delete(DeleteConfig {
+			effect: ClearOrDelete::Clear,
+			which: WhichToDelete::All
+		}),
+		ev_stream,
+		tmux_offset
+	)
+	.await
+	.map(|_| ())
+}
+
+async fn delete_kitty_images(
+	ev_stream: &mut EventStream,
+	tmux_offset: Option<(u16, u16)>
+) -> Result<(), TransmitError<<&mut EventStream as kittage::AsyncInputReader>::Error>> {
+	run_action(
+		Action::Delete(DeleteConfig {
+			effect: ClearOrDelete::Delete,
+			which: WhichToDelete::All
+		}),
+		ev_stream,
+		tmux_offset
+	)
+	.await
+	.map(|_| ())
 }
 
 fn main() -> Result<(), WrappedErr> {
@@ -236,7 +270,8 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		std::io::stdout(),
 		EnterAlternateScreen,
 		crossterm::cursor::Hide,
-		crossterm::event::EnableMouseCapture
+		crossterm::event::EnableMouseCapture,
+		EnableFocusChange
 	)
 	.map_err(|e| {
 		WrappedErr(
@@ -267,6 +302,12 @@ async fn inner_main() -> Result<(), WrappedErr> {
 			)),
 			e => Err(WrappedErr(format!("Couldn't get the necessary information to set up images: {e}").into()))
 		})?;
+	let mut picker = picker;
+	let in_tmux = std::env::var_os("TMUX").is_some();
+	let is_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "iTerm.app");
+	if is_iterm2 && !in_tmux {
+		picker.set_protocol_type(ProtocolType::Iterm2);
+	}
 
 	// then we want to spawn off the rendering task
 	// We need to use the thread::spawn API so that this exists in a thread not owned by tokio,
@@ -298,7 +339,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let (to_main, from_converter) = flume::unbounded();
 
 	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
-	let tmux_offset = if is_kitty && std::env::var_os("TMUX").is_some() {
+	let tmux_offset = if is_kitty && in_tmux {
 		Some(get_tmux_pane_offset().unwrap_or((0, 0)))
 	} else {
 		None
@@ -315,7 +356,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		|n| n.to_string_lossy().to_string()
 	);
 	let initial_page = flags.page.unwrap_or(1).saturating_sub(1);
-	let mut tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty, tmux_offset.is_some());
+	let mut tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty);
 	if initial_page > 0 {
 		tui.page = initial_page;
 	}
@@ -370,7 +411,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let from_converter = from_converter.into_stream();
 
 	enter_redraw_loop(
-		ev_stream,
+		&mut ev_stream,
 		to_renderer,
 		tui_rx,
 		to_converter,
@@ -392,15 +433,10 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		)
 	})?;
 
-	// Delete all Kitty images from the underlying terminal via DCS passthrough on exit,
-	// since LeaveAlternateScreen only affects tmux's virtual terminal
-	if tmux_offset.is_some() {
-		let mut stdout = std::io::stdout().lock();
-		// \x1b_Ga=d,d=A\x1b\\ (delete all) wrapped in DCS passthrough with ESC doubled
-		stdout
-			.write_all(b"\x1bPtmux;\x1b\x1b_Ga=d,d=A\x1b\x1b\\\x1b\\")
-			.unwrap();
-		stdout.flush().unwrap();
+	if is_kitty {
+		delete_kitty_images(&mut ev_stream, tmux_offset).await.map_err(|e| {
+			WrappedErr(format!("Couldn't delete Kitty images while exiting: {e}").into())
+		})?;
 	}
 
 	drop(maybe_logger);
@@ -410,7 +446,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 // oh shut up clippy who cares
 #[expect(clippy::too_many_arguments)]
 async fn enter_redraw_loop(
-	mut ev_stream: EventStream,
+	ev_stream: &mut EventStream,
 	to_renderer: Sender<RenderNotif>,
 	mut tui_rx: RecvStream<'_, Result<RenderInfo, RenderError>>,
 	to_converter: Sender<ConverterMsg>,
@@ -422,6 +458,8 @@ async fn enter_redraw_loop(
 	font_size: FontSize,
 	tmux_offset: Option<(u16, u16)>
 ) -> Result<(), Box<dyn Error>> {
+	let mut app_focused = true;
+
 	loop {
 		let mut needs_redraw = true;
 		let next_ev = ev_stream.next().fuse();
@@ -449,6 +487,17 @@ async fn enter_redraw_loop(
 						}
 					}
 				}
+
+				if ev.is_focus_lost() {
+					app_focused = false;
+					needs_redraw = false;
+					if tmux_offset.is_some() {
+						clear_kitty_images(ev_stream, tmux_offset).await?;
+					}
+				} else if ev.is_focus_gained() {
+					app_focused = true;
+					needs_redraw = true;
+				}
 			},
 			Some(renderer_msg) = tui_rx.next() => {
 				match renderer_msg {
@@ -470,8 +519,13 @@ async fn enter_redraw_loop(
 			}
 			Some(img_res) = from_converter.next() => {
 				match img_res {
-					Ok(ConvertedPage { page, num, num_results }) => {
-						tui.page_ready(page, num, num_results);
+					Ok(ConvertedPage {
+						page,
+						num,
+						generation,
+						num_results
+					}) => {
+						tui.page_ready(page, num, generation, num_results);
 						if num == tui.page {
 							needs_redraw = true;
 						}
@@ -494,22 +548,24 @@ async fn enter_redraw_loop(
 				to_display = tui.render(f, &main_area, font_size);
 			})?;
 
-			if let Err((to_replace, err_desc, enum_err)) =
-				display_kitty_images(to_display, &mut ev_stream, tmux_offset).await
-			{
-				match enum_err {
-					// This is the error that kitty & ghostty provide us when they delete
-					// an image due to memory constraints, so if we get it, we just fix
-					// it by re-rendering so it don't display it to the user
-					TransmitError::Terminal(TerminalError::NoEntity(_)) => (),
-					_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(
-						format!("{err_desc}: {enum_err}")
-					)))
-				}
+			if app_focused {
+				if let Err((to_replace, err_desc, enum_err)) =
+					display_kitty_images(to_display, ev_stream, tmux_offset).await
+				{
+					match enum_err {
+						// This is the error that kitty & ghostty provide us when they delete
+						// an image due to memory constraints, so if we get it, we just fix
+						// it by re-rendering so it don't display it to the user
+						TransmitError::Terminal(TerminalError::NoEntity(_)) => (),
+						_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(
+							format!("{err_desc}: {enum_err}")
+						)))
+					}
 
-				for page_num in to_replace {
-					tui.page_failed_display(page_num);
-					to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+					for page_num in to_replace {
+						tui.page_failed_display(page_num);
+						to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+					}
 				}
 			}
 
