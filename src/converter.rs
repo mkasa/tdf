@@ -1,13 +1,60 @@
-use flume::{Receiver, SendError, Sender, TryRecvError};
-use futures_util::stream::StreamExt;
-use image::ImageFormat;
-use itertools::Itertools;
-use ratatui_image::{picker::Picker, protocol::Protocol, Resize};
+use std::{
+	num::NonZeroUsize,
+	time::{SystemTime, UNIX_EPOCH}
+};
 
-use crate::renderer::{fill_default, PageInfo, RenderError};
+use flume::{Receiver, SendError, Sender, TryRecvError};
+use futures_util::stream::StreamExt as _;
+use image::DynamicImage;
+use kittage::{NumberOrId, action::NONZERO_ONE};
+use ratatui::layout::Rect;
+use ratatui_image::{
+	Resize,
+	picker::{Picker, ProtocolType},
+	protocol::Protocol
+};
+use rayon::iter::ParallelIterator as _;
+
+use crate::{
+	renderer::{PageInfo, RenderError, fill_default},
+	skip::InterleavedAroundWithMax
+};
+
+#[derive(Debug)]
+pub enum MaybeTransferred {
+	NotYet(kittage::image::Image<'static>),
+	Transferred(kittage::ImageId)
+}
+
+#[derive(Debug)]
+pub enum ConvertedImage {
+	Generic(Protocol),
+	Kitty {
+		img: MaybeTransferred,
+		cell_w: u16,
+		cell_h: u16
+	}
+}
+
+impl ConvertedImage {
+	#[must_use]
+	pub fn w_h(&self) -> (u16, u16) {
+		match self {
+			Self::Generic(prot) => {
+				let a = prot.area();
+				(a.width, a.height)
+			}
+			Self::Kitty {
+				img: _,
+				cell_w,
+				cell_h
+			} => (*cell_w, *cell_h)
+		}
+	}
+}
 
 pub struct ConvertedPage {
-	pub page: Box<dyn Protocol>,
+	pub page: ConvertedImage,
 	pub num: usize,
 	pub num_results: usize
 }
@@ -21,18 +68,22 @@ pub enum ConverterMsg {
 pub async fn run_conversion_loop(
 	sender: Sender<Result<ConvertedPage, RenderError>>,
 	receiver: Receiver<ConverterMsg>,
-	mut picker: Picker,
-	prerender: usize
+	picker: Picker,
+	prerender: usize,
+	shms_work: bool
 ) -> Result<(), SendError<Result<ConvertedPage, RenderError>>> {
 	let mut images = vec![];
 	let mut page: usize = 0;
+	let pid = std::process::id();
 
 	fn next_page(
 		images: &mut [Option<PageInfo>],
-		picker: &mut Picker,
+		picker: &Picker,
 		page: usize,
 		iteration: &mut usize,
-		prerender: usize
+		prerender: usize,
+		pid: u32,
+		shms_work: bool
 	) -> Result<Option<ConvertedPage>, RenderError> {
 		if images.is_empty() || *iteration >= prerender {
 			return Ok(None);
@@ -43,51 +94,108 @@ pub async fn run_conversion_loop(
 		let idx_start = page.saturating_sub(prerender / 2);
 		let idx_end = idx_start.saturating_add(prerender).min(images.len());
 
+		// If there's none to render, then why bother.
+		let Some(idx_end) = NonZeroUsize::new(idx_end) else {
+			return Ok(None);
+		};
+
 		// then we go through all the indices available to us and find the first one that has an
 		// image available to steal
-		let Some((page_info, new_iter)) = (idx_start..page)
-			.interleave(page..idx_end)
-			.enumerate()
-			.skip(*iteration)
-			.find_map(|(i_idx, p_idx)| images[p_idx].take().map(|p| (p, i_idx)))
+		let Some((page_info, new_iter, page_num)) =
+			InterleavedAroundWithMax::new(page, idx_start, idx_end)
+				.enumerate()
+				.take(prerender)
+				// .skip(*iteration)
+				.find_map(|(i_idx, p_idx)| images[p_idx].take().map(|p| (p, i_idx, p_idx)))
 		else {
 			return Ok(None);
 		};
 
-		let img_area = page_info.img_data.area;
+		let mut dyn_img = image::load_from_memory_with_format(
+			&page_info.img_data.pixels,
+			image::ImageFormat::Pnm
+		)
+		.map_err(|e| RenderError::Converting(format!("Can't load image: {e}")))?;
 
-		let dyn_img =
-			image::load_from_memory_with_format(&page_info.img_data.data, ImageFormat::Png)
-				.map_err(|e| {
-					RenderError::Render(format!("Couldn't convert Vec<u8> to DynamicImage: {e}"))
-				})?;
+		match dyn_img {
+			DynamicImage::ImageRgb8(ref mut img) =>
+				for quad in &*page_info.result_rects {
+					img.par_enumerate_pixels_mut()
+						.filter(|(x, y, _)| {
+							*x > quad.ul_x && *x < quad.lr_x && *y > quad.ul_y && *y < quad.lr_y
+						})
+						.for_each(|(_, _, px)| px.0[2] = px.0[2].saturating_sub(u8::MAX / 2));
+				},
+			_ => unreachable!()
+		}
 
-		// We don't actually want to Crop this image, but we've already
-		// verified (with the ImageSurface stuff) that the image is the correct
-		// size for the area given, so to save ratatui the work of having to
-		// resize it, we tell them to crop it to fit.
-		let txt_img = picker
-			.new_protocol(dyn_img, img_area, Resize::None)
-			.map_err(|e| {
-				RenderError::Render(format!(
-					"Couldn't convert DynamicImage to ratatui image: {e}"
-				))
-			})?;
+		let img_area = Rect {
+			width: page_info.img_data.cell_w,
+			height: page_info.img_data.cell_h,
+			x: 0,
+			y: 0
+		};
+
+		let txt_img = match picker.protocol_type() {
+			ProtocolType::Kitty => {
+				let rn = SystemTime::now()
+					.duration_since(UNIX_EPOCH)
+					.unwrap_or_default()
+					.as_nanos() % 1_000_000;
+
+				let mut img = if shms_work {
+					let shm_name = format!("/tdf_{pid}_{rn}_{page_num}");
+
+					#[cfg(unix)]
+					let shm_name = &*shm_name;
+
+					kittage::image::Image::shm_from(dyn_img, shm_name).map_err(|e| {
+						RenderError::Converting(format!("Couldn't create shm: {e:?}"))
+					})?
+				} else {
+					kittage::image::Image::from(dyn_img)
+				};
+
+				// if ur pdf has 4 billion pages then you deserve to suffer
+				img.num_or_id = NumberOrId::Id(NONZERO_ONE.saturating_add(page_num as u32));
+
+				ConvertedImage::Kitty {
+					img: MaybeTransferred::NotYet(img),
+					cell_w: page_info.img_data.cell_w,
+					cell_h: page_info.img_data.cell_h
+				}
+			}
+			_ => ConvertedImage::Generic(
+				picker
+					.new_protocol(dyn_img, img_area, Resize::None)
+					.map_err(|e| {
+						RenderError::Converting(format!(
+							"Couldn't convert DynamicImage to ratatui image: {e}"
+						))
+					})?
+			)
+		};
+
+		log::debug!(
+			"got converted page for num {} with results {:?}",
+			page_info.page_num,
+			page_info.result_rects
+		);
 
 		// update the iteration to the iteration that we stole this image from
 		*iteration = new_iter;
 
 		Ok(Some(ConvertedPage {
 			page: txt_img,
-			num: page_info.page,
-			num_results: page_info.search_results
+			num: page_info.page_num,
+			num_results: page_info.result_rects.len()
 		}))
 	}
 
 	fn handle_notif(msg: ConverterMsg, images: &mut Vec<Option<PageInfo>>, page: &mut usize) {
 		match msg {
 			ConverterMsg::AddImg(img) => {
-				let page_num = img.page;
+				let page_num = img.page_num;
 				images[page_num] = Some(img);
 			}
 			ConverterMsg::NumPages(n_pages) => {
@@ -111,7 +219,15 @@ pub async fn run_conversion_loop(
 				Err(TryRecvError::Disconnected) => return Ok(())
 			}
 
-			match next_page(&mut images, &mut picker, page, &mut iteration, prerender) {
+			match next_page(
+				&mut images,
+				&picker,
+				page,
+				&mut iteration,
+				prerender,
+				pid,
+				shms_work
+			) {
 				Ok(None) => break,
 				Ok(Some(img)) => sender.send(Ok(img))?,
 				Err(e) => sender.send(Err(e))?

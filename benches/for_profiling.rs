@@ -1,5 +1,9 @@
+use ratatui_image::picker::ProtocolType;
+
 mod utils;
-use std::sync::{Arc, Mutex};
+
+const BLACK: i32 = 0;
+const WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
 
 #[tokio::main]
 async fn main() {
@@ -10,5 +14,5 @@ async fn main() {
 		.nth(1)
 		.expect("Please enter a file to profile");
 
-	utils::render_doc(file, Arc::new(Mutex::new(1.0)), Arc::new(Mutex::new((0.0, 0.0))), true).await;
+	utils::render_doc(file, None, BLACK, WHITE, ProtocolType::Kitty).await;
 }

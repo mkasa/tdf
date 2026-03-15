@@ -1,290 +1,655 @@
-#![feature(if_let_guard)]
-
+use core::{
+	error::Error,
+	num::{NonZeroU32, NonZeroUsize}
+};
 use std::{
-	io::{stdout, Read, Write},
+	borrow::Cow,
+	ffi::OsString,
+	io::{BufReader, Read as _, Stdout, Write as _, stdout},
+	mem,
 	path::PathBuf,
-	str::FromStr,
-    sync::{Arc, Mutex},
+	sync::{Arc, Mutex},
+	time::Duration
 };
 
-use converter::{run_conversion_loop, ConvertedPage, ConverterMsg};
 use crossterm::{
+	event::EventStream,
 	execute,
 	terminal::{
-		disable_raw_mode, enable_raw_mode, window_size, EndSynchronizedUpdate,
-		EnterAlternateScreen, LeaveAlternateScreen
+		EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+		enable_raw_mode, window_size
 	}
 };
-use futures_util::{stream::StreamExt, FutureExt};
-use glib::{LogField, LogLevel, LogWriterOutput};
-use notify::{RecursiveMode, Watcher};
-use ratatui::{backend::CrosstermBackend, Terminal};
-use ratatui_image::picker::Picker;
-use renderer::{RenderInfo, RenderNotif};
-use tui::{InputAction, Tui};
-use clap::{Arg, Command};
-
-mod converter;
-mod renderer;
-mod skip;
-mod tui;
+use debounce::EventDebouncer;
+use flexi_logger::FileSpec;
+use flume::{Sender, r#async::RecvStream};
+use futures_util::{FutureExt as _, stream::StreamExt as _};
+use kittage::{
+	action::Action,
+	delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
+	error::{TerminalError, TransmitError}
+};
+use notify::{Event, EventKind, RecursiveMode, Watcher as _};
+use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui_image::{
+	FontSize,
+	picker::{Picker, ProtocolType}
+};
+use tdf::{
+	PrerenderLimit,
+	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
+	kitty::{KittyDisplay, display_kitty_images, do_shms_work, run_action},
+	renderer::{self, MUPDF_BLACK, MUPDF_WHITE, RenderError, RenderInfo, RenderNotif},
+	tui::{BottomMessage, InputAction, MessageSetting, Tui}
+};
 
 // Dummy struct for easy errors in main
-#[derive(Debug)]
-struct BadTermSizeStdin(String);
+struct WrappedErr(Cow<'static, str>);
 
-impl std::fmt::Display for BadTermSizeStdin {
+impl std::fmt::Display for WrappedErr {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0)
 	}
 }
 
-impl std::error::Error for BadTermSizeStdin {}
+impl std::fmt::Debug for WrappedErr {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		std::fmt::Display::fmt(self, f)
+	}
+}
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+impl std::error::Error for WrappedErr {}
+
+fn reset_term() {
+	_ = disable_raw_mode();
+	_ = execute!(
+		std::io::stdout(),
+		LeaveAlternateScreen,
+		crossterm::cursor::Show,
+		crossterm::event::DisableMouseCapture
+	);
+}
+
+fn main() -> Result<(), WrappedErr> {
+	let rt = tokio::runtime::Builder::new_multi_thread()
+		.worker_threads(3)
+		.enable_time()
+		.build()
+		.unwrap();
+
+	rt.block_on(async move {
+		let result = inner_main().await;
+		reset_term();
+		result
+	})
+}
+
+async fn inner_main() -> Result<(), WrappedErr> {
+	let hook = std::panic::take_hook();
+	std::panic::set_hook(Box::new(move |info| {
+		reset_term();
+		hook(info);
+	}));
+
 	#[cfg(feature = "tracing")]
 	console_subscriber::init();
-    const VERSION: &str = env!("CARGO_PKG_VERSION");
-    let matches = Command::new("tdf")
-        .version(VERSION)
-        .author("itsjunetime")
-        .about("A terminal document viewer (plus a little tweak by mkasa)")
-        .arg(Arg::new("file")
-             .help("The pdf file to open")
-             .required(true)
-             .index(1))
-        .arg(Arg::new("center")
-            .help("Center the images in the terminal")
-            .short('c')
-            .long("center")
-            .action(clap::ArgAction::SetTrue))
-        .arg(Arg::new("multipage")
-            .help("Multipage mode")
-            .short('m')
-            .long("multipage")
-            .action(clap::ArgAction::SetTrue))
-        .arg(Arg::new("page")
-            .help("The page to open the document on")
-            .short('p')
-            .long("page")
-            .value_parser(clap::value_parser!(usize)))
-        .arg(Arg::new("zoom")
-            .help("The zoom level to open the document on")
-            .short('z')
-            .long("zoom")
-            .value_parser(clap::value_parser!(f64)))
-        .get_matches();
-    let should_center = matches.get_flag("center");
-    let multiple_page_mode = matches.get_flag("multipage");
-    let file = matches.get_one::<String>("file").expect("specify a pdf");
-    let zoom_level = *matches.get_one::<f64>("zoom").unwrap_or(&1.0);
-    let initial_page_num = *matches.get_one::<usize>("page").unwrap_or(&1) - 1;
-	let path = PathBuf::from_str(&file)?.canonicalize()?;
 
-	//let (watch_tx, render_rx) = tokio::sync::mpsc::unbounded_channel();
-	let (watch_tx, render_rx) = flume::unbounded();
-	let tui_tx = watch_tx.clone();
+	const DEFAULT_DEBOUNCE_DELAY: Duration = Duration::from_millis(50);
 
-	// we need to call this outside the recommended_watcher call because if we call it inside, that
-	// will be calling it from a thread not owned by the tokio runtime (since it's created by
-	// calling thread::spawn) and that will cause a panic
-	let mut watcher = notify::recommended_watcher(move |_| {
-		// This shouldn't fail to send unless the receiver gets disconnected. If that's happened,
-		// then like the main thread has panicked or something, so it doesn't matter we don't
-		// handle the error here
-		_ = watch_tx.send(renderer::RenderNotif::Reload);
+	let flags = xflags::parse_or_exit! {
+		/// Display the pdf with the pages starting at the right hand size and moving left and
+		/// adjust input keys to match
+		optional -r,--r-to-l
+		/// The maximum number of pages to display together, horizontally, at a time
+		optional -m,--max-wide max_wide: NonZeroUsize
+		/// Fullscreen the pdf (hide document name, page count, etc)
+		optional -f,--fullscreen
+		/// The time to wait for the file to stop changing before reloading, in milliseconds.
+		/// Defaults to 50ms.
+		optional --reload-delay reload_delay: u64
+		/// The number of pages to prerender surrounding the currently-shown page; 0 means no
+		/// limit. By default, there is no limit.
+		optional -p,--prerender prerender: usize
+		/// Custom white color, specified in css format (e.g. "FFFFFF" or "rgb(255, 255, 255)")
+		optional -w,--white-color white: String
+		/// Custom black color, specified in css format (e.g "000000" or "rgb(0, 0, 0)")
+		optional -b,--black-color black: String
+		/// The page number to open the document on (1-indexed)
+		optional --page page: usize
+		/// Print the version and exit
+		optional --version
+		/// PDF file to read
+		optional file: PathBuf
+	};
+
+	if flags.version {
+		println!("{}", env!("CARGO_PKG_VERSION"));
+		return Ok(());
+	}
+
+	let Some(file) = flags.file else {
+		return Err(WrappedErr(
+			"Please specify the file to open, e.g. `tdf ./my_example_pdf.pdf`".into()
+		));
+	};
+
+	let path = file
+		.canonicalize()
+		.map_err(|e| WrappedErr(format!("Cannot canonicalize provided file: {e}").into()))?;
+
+	let black = flags
+		.black_color
+		.as_deref()
+		.map(|color| {
+			parse_color_to_i32(color).map_err(|e| {
+				WrappedErr(
+					format!(
+						"Couldn't parse black color {color:?}: {e} - is it formatted like a CSS color?"
+					)
+					.into()
+				)
+			})
+		})
+		.transpose()?
+		.unwrap_or(MUPDF_BLACK);
+
+	let white = flags
+		.white_color
+		.as_deref()
+		.map(|color| {
+			parse_color_to_i32(color).map_err(|e| {
+				WrappedErr(
+					format!(
+						"Couldn't parse white color {color:?}: {e} - is it formatted like a CSS color?"
+					)
+					.into()
+				)
+			})
+		})
+		.transpose()?
+		.unwrap_or(MUPDF_WHITE);
+
+	// need to keep it around throughout the lifetime of the program, but don't rly need to use it.
+	// Just need to make sure it doesn't get dropped yet.
+	let maybe_logger = if std::env::var("RUST_LOG").is_ok() {
+		Some(
+			flexi_logger::Logger::try_with_env()
+				.map_err(|e| WrappedErr(format!("Couldn't create initial logger: {e}").into()))?
+				.log_to_file(FileSpec::try_from("./debug.log").map_err(|e| {
+					WrappedErr(format!("Couldn't create FileSpec for logger: {e}").into())
+				})?)
+				.start()
+				.map_err(|e| WrappedErr(format!("Can't start logger: {e}").into()))?
+		)
+	} else {
+		None
+	};
+
+	let (watch_to_render_tx, render_rx) = flume::unbounded();
+	let to_renderer = watch_to_render_tx.clone();
+
+	let (render_tx, tui_rx) = flume::unbounded();
+	let watch_to_tui_tx = render_tx.clone();
+
+	let mut watcher = notify::recommended_watcher(on_notify_ev(
+		watch_to_tui_tx,
+		watch_to_render_tx,
+		path.file_name()
+			.ok_or_else(|| WrappedErr("Path does not have a last component??".into()))?
+			.to_owned(),
+		flags
+			.reload_delay
+			.map_or(DEFAULT_DEBOUNCE_DELAY, Duration::from_millis)
+	))
+	.map_err(|e| WrappedErr(format!("Couldn't start watching the provided file: {e}").into()))?;
+
+	// So we have to watch the parent directory of the file that we are interested in because the
+	// `notify` library works on inodes, and if the file is deleted, that inode is gone as well,
+	// and then the notify library just gives up on trying to watch for the file reappearing. Imo
+	// they should start watching the parent directory if the file is deleted, and then wait for it
+	// to reappear and then begin watching it again, but whatever. It seems they've made their
+	// opinion on this clear
+	// (https://github.com/notify-rs/notify/issues/113#issuecomment-281836995) so whatever, guess
+	// we have to do this annoying workaround.
+	watcher
+		.watch(
+			path.parent().expect("The root directory is not a PDF"),
+			RecursiveMode::NonRecursive
+		)
+		.map_err(|e| WrappedErr(format!("Can't watch the provided file: {e}").into()))?;
+
+	let mut window_size = window_size().map_err(|e| {
+		WrappedErr(format!("Can't get your current terminal window size: {e}").into())
 	})?;
 
-	// We're making this nonrecursive 'cause we're just watching a single file, so there's nothing
-	// to recurse into
-	watcher.watch(&path, RecursiveMode::NonRecursive)?;
-
-	let file_path = format!("file://{}", path.clone().into_os_string().to_string_lossy());
-	let (render_tx, tui_rx) = flume::unbounded();
-
-	let mut window_size = window_size()?;
-
 	if window_size.width == 0 || window_size.height == 0 {
-		// send the command code to get the terminal window size
-		print!("\x1b[14t");
-		std::io::stdout().flush()?;
+		let (w, h) = get_font_size_through_stdio()?;
 
-		// we need to enable raw mode here since this bit of output won't print a newline; it'll
-		// just print the info it wants to tell us. So we want to get all characters as they come
-		enable_raw_mode()?;
-
-		// read in the returned size until we hit a 't' (which indicates to us it's done)
-		let input_vec = std::io::stdin()
-			.bytes()
-			.flat_map(|b| b.ok())
-			.take_while(|b| *b != b't')
-			.collect::<Vec<_>>();
-
-		// and then disable raw mode again in case we return an error in this next section
-		disable_raw_mode()?;
-
-		let input_line = String::from_utf8(input_vec)?;
-
-		if input_line.starts_with("\x1b[4;") {
-			// it should input it to us as `\e[4;<height>;<width>t`, so we need to split to get the h/w
-			let mut splits = input_line.split([';', 't']);
-			// ignore the first val
-			_ = splits.next();
-
-			window_size.height = splits
-				.next()
-				.ok_or_else(|| {
-					BadTermSizeStdin(format!(
-						"Terminal responded with unparseable size response '{input_line}'"
-					))
-				})?
-				.parse::<u16>()?;
-
-			window_size.width = splits
-				.next()
-				.ok_or_else(|| {
-					BadTermSizeStdin(format!(
-						"Terminal responded with unparseable size response '{input_line}'"
-					))
-				})?
-				.parse::<u16>()?;
-		} else {
-			return Err("Your terminal is falsely reporting a window size of 0; tdf needs an accurate window size to display graphics".into());
-		}
+		window_size.width = w;
+		window_size.height = h;
 	}
+
+	let cell_height_px = window_size.height / window_size.rows;
+	let cell_width_px = window_size.width / window_size.columns;
+
+	execute!(
+		std::io::stdout(),
+		EnterAlternateScreen,
+		crossterm::cursor::Hide,
+		crossterm::event::EnableMouseCapture
+	)
+	.map_err(|e| {
+		WrappedErr(
+			format!(
+				"Couldn't enter the alternate screen and hide the cursor for proper presentation: {e}"
+			)
+			.into()
+		)
+	})?;
 
 	// We need to create `picker` on this thread because if we create it on the `renderer` thread,
 	// it messes up something with user input. Input never makes it to the crossterm thing
-	let mut picker = Picker::new((
-		window_size.width / window_size.columns,
-		window_size.height / window_size.rows
-	));
-	picker.guess_protocol();
+	let picker = Picker::from_query_stdio()
+		.or_else(|e| match e {
+			ratatui_image::errors::Errors::NoFontSize if
+				window_size.width != 0
+				&& window_size.height != 0
+				&& window_size.columns != 0
+				&& window_size.rows != 0 =>
+			{
+				// the 'equivalent' that is suggested instead is not the same. We need to keep
+				// calling this.
+				#[expect(deprecated)]
+				Ok(Picker::from_fontsize((cell_width_px, cell_height_px)))
+			},
+			ratatui_image::errors::Errors::NoFontSize => Err(WrappedErr(
+				"Unable to detect your terminal's font size; this is an issue with your terminal emulator.\nPlease use a different terminal emulator or report this bug to tdf.".into()
+			)),
+			e => Err(WrappedErr(format!("Couldn't get the necessary information to set up images: {e}").into()))
+		})?;
 
 	// then we want to spawn off the rendering task
 	// We need to use the thread::spawn API so that this exists in a thread not owned by tokio,
 	// since the methods we call in `start_rendering` will panic if called in an async context
-    let zoom_level_shared = Arc::new(Mutex::new(zoom_level));
-    let zoom_level_shared_1 = Arc::clone(&zoom_level_shared);
-    let offset_shared = Arc::new(Mutex::new((0.0, 0.0)));
-    let offset_shared_1 = Arc::clone(&offset_shared);
+	let prerender = flags
+		.prerender
+		.and_then(NonZeroUsize::new)
+		.map_or(PrerenderLimit::All, PrerenderLimit::Limited);
+
+	let file_path = path.clone();
 	std::thread::spawn(move || {
-		renderer::start_rendering(file_path, render_tx, render_rx, window_size, zoom_level_shared_1, offset_shared_1, multiple_page_mode)
+		renderer::start_rendering(
+			&file_path,
+			render_tx,
+			render_rx,
+			cell_height_px,
+			cell_width_px,
+			prerender,
+			black,
+			white
+		)
 	});
+
+	let font_size = picker.font_size();
 
 	let mut ev_stream = crossterm::event::EventStream::new();
 
 	let (to_converter, from_main) = flume::unbounded();
 	let (to_main, from_converter) = flume::unbounded();
 
-	tokio::spawn(run_conversion_loop(to_main, from_main, picker, 20));
+	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
+	let tmux_offset = if is_kitty && std::env::var_os("TMUX").is_some() {
+		Some(get_tmux_pane_offset().unwrap_or((0, 0)))
+	} else {
+		None
+	};
 
-	let file_name = path
-		.file_name()
-		.map(|n| n.to_string_lossy())
-		.unwrap_or_else(|| "Unknown file".into())
-		.to_string();
-    let zoom_level_shared_2 = Arc::clone(&zoom_level_shared);
-    let offset_shared_2 = Arc::clone(&offset_shared);
-	let mut tui = tui::Tui::new(file_name, should_center, initial_page_num, zoom_level_shared_2, offset_shared_2, multiple_page_mode);
+	let shms_work = is_kitty && do_shms_work(&mut ev_stream, tmux_offset).await;
+
+	tokio::spawn(run_conversion_loop(
+		to_main, from_main, picker, 20, shms_work
+	));
+
+	let file_name = path.file_name().map_or_else(
+		|| "Unknown file".into(),
+		|n| n.to_string_lossy().to_string()
+	);
+	let initial_page = flags.page.unwrap_or(1).saturating_sub(1);
+	let mut tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty);
+	if initial_page > 0 {
+		tui.page = initial_page;
+	}
 
 	let backend = CrosstermBackend::new(std::io::stdout());
-	let mut term = Terminal::new(backend)?;
+	let mut term = Terminal::new(backend).map_err(|e| {
+		WrappedErr(format!("Couldn't set up crossterm's terminal backend: {e}").into())
+	})?;
 	term.skip_diff(true);
 
-	// poppler has some annoying logging (e.g. if you request a page index out-of-bounds of a
-	// document's pages, then it will return `None`, but still log to stderr with CRITICAL level),
-	// so we want to just ignore all logging since this is a tui app.
-	glib::log_set_writer_func(noop);
+	enable_raw_mode().map_err(|e| {
+		WrappedErr(
+			format!("Can't enable raw mode, which is necessary to receive input: {e}").into()
+		)
+	})?;
 
-	execute!(
-		term.backend_mut(),
-		EnterAlternateScreen,
-		crossterm::cursor::Hide
-	)?;
-	enable_raw_mode()?;
+	if is_kitty {
+		run_action(
+			Action::Delete(DeleteConfig {
+				effect: ClearOrDelete::Delete,
+				which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
+			}),
+			&mut ev_stream,
+			tmux_offset
+		)
+		.await
+		.map_err(|e| {
+			WrappedErr(format!("Couldn't delete all previous images from memory: {e}").into())
+		})?;
+	}
 
-	let mut main_area = tui::Tui::main_layout(&term.get_frame());
-	tui_tx.send(RenderNotif::Area(main_area[1]))?;
+	let fullscreen = flags.fullscreen;
+	let main_area = Tui::main_layout(&term.get_frame(), fullscreen);
+	to_renderer
+		.send(RenderNotif::Area(main_area.page_area))
+		.map_err(|e| {
+			WrappedErr(
+				format!("Couldn't inform the rendering thread of the available area: {e}").into()
+			)
+		})?;
 
-	let mut tui_rx = tui_rx.into_stream();
-	let mut from_converter = from_converter.into_stream();
+	if initial_page > 0 {
+		to_renderer.send(RenderNotif::JumpToPage(initial_page)).map_err(|e| {
+			WrappedErr(format!("Couldn't inform the rendering thread of the initial page: {e}").into())
+		})?;
+		to_converter.send(ConverterMsg::GoToPage(initial_page)).map_err(|e| {
+			WrappedErr(format!("Couldn't inform the converter of the initial page: {e}").into())
+		})?;
+	}
 
+	let tui_rx = tui_rx.into_stream();
+	let from_converter = from_converter.into_stream();
+
+	enter_redraw_loop(
+		ev_stream,
+		to_renderer,
+		tui_rx,
+		to_converter,
+		from_converter,
+		fullscreen,
+		tui,
+		&mut term,
+		main_area,
+		font_size,
+		tmux_offset
+	)
+	.await
+	.map_err(|e| {
+		WrappedErr(
+			format!(
+				"An unexpected error occurred while communicating between different parts of tdf: {e}"
+			)
+			.into()
+		)
+	})?;
+
+	drop(maybe_logger);
+	Ok(())
+}
+
+// oh shut up clippy who cares
+#[expect(clippy::too_many_arguments)]
+async fn enter_redraw_loop(
+	mut ev_stream: EventStream,
+	to_renderer: Sender<RenderNotif>,
+	mut tui_rx: RecvStream<'_, Result<RenderInfo, RenderError>>,
+	to_converter: Sender<ConverterMsg>,
+	mut from_converter: RecvStream<'_, Result<ConvertedPage, RenderError>>,
+	mut fullscreen: bool,
+	mut tui: Tui,
+	term: &mut Terminal<CrosstermBackend<Stdout>>,
+	mut main_area: tdf::tui::RenderLayout,
+	font_size: FontSize,
+	tmux_offset: Option<(u16, u16)>
+) -> Result<(), Box<dyn Error>> {
 	loop {
-		let mut needs_redraw = tokio::select! {
+		let mut needs_redraw = true;
+		let next_ev = ev_stream.next().fuse();
+		tokio::select! {
 			// First we check if we have any keystrokes
-			Some(ev) = ev_stream.next().fuse() => {
+			Some(ev) = next_ev => {
 				// If we can't get user input, just crash.
 				let ev = ev.expect("Couldn't get any user input");
 
-				match tui.handle_event(ev) {
-					None => false,
-					Some(action) => {
-						match action {
-							InputAction::Redraw => (),
-							InputAction::QuitApp => break,
-                            InputAction::ChangeZoomLevel => {
-                                tui_tx.send(RenderNotif::ZoomLevelChange)?;
-                            },
-							InputAction::JumpingToPage(page) => {
-								tui_tx.send(RenderNotif::JumpToPage(page))?;
-								to_converter.send(ConverterMsg::GoToPage(page))?;
-							},
-							InputAction::Search(term) => tui_tx.send(RenderNotif::Search(term))?,
-						};
-						true
+				match tui.handle_event(&ev) {
+					None => needs_redraw = false,
+					Some(action) => match action {
+						InputAction::Redraw => (),
+						InputAction::QuitApp => return Ok(()),
+						InputAction::JumpingToPage(page) => {
+							to_renderer.send(RenderNotif::JumpToPage(page))?;
+							to_converter.send(ConverterMsg::GoToPage(page))?;
+						},
+						InputAction::Search(term) => to_renderer.send(RenderNotif::Search(term))?,
+						InputAction::Invert => to_renderer.send(RenderNotif::Invert)?,
+						InputAction::Rotate => to_renderer.send(RenderNotif::Rotate)?,
+						InputAction::Fullscreen => fullscreen = !fullscreen,
+						InputAction::SwitchRenderZoom(f_or_f) => {
+							to_renderer.send(RenderNotif::SwitchFitOrFill(f_or_f)).unwrap();
+						}
 					}
 				}
 			},
 			Some(renderer_msg) = tui_rx.next() => {
 				match renderer_msg {
-					Ok(RenderInfo::NumPages(num)) => {
-						tui.set_n_pages(num);
-						to_converter.send(ConverterMsg::NumPages(num))?;
-					},
-					Ok(RenderInfo::Page(info)) => {
-						tui.got_num_results_on_page(info.page, info.search_results);
-						to_converter.send(ConverterMsg::AddImg(info))?;
+					Ok(render_info) => match render_info {
+						RenderInfo::NumPages(num) => {
+							tui.set_n_pages(num);
+							to_converter.send(ConverterMsg::NumPages(num))?;
+						},
+						RenderInfo::Page(info) => {
+							tui.got_num_results_on_page(info.page_num, info.result_rects.len());
+							to_converter.send(ConverterMsg::AddImg(info))?;
+						},
+						RenderInfo::Reloaded => tui.set_msg(MessageSetting::Some(BottomMessage::Reloaded)),
+						RenderInfo::SearchResults { page_num, num_results } =>
+							tui.got_num_results_on_page(page_num, num_results),
 					},
 					Err(e) => tui.show_error(e),
 				}
-				true
 			}
 			Some(img_res) = from_converter.next() => {
 				match img_res {
-					Ok(ConvertedPage { page, num, num_results }) => tui.page_ready(page, num, num_results),
+					Ok(ConvertedPage { page, num, num_results }) => {
+						tui.page_ready(page, num, num_results);
+						if num == tui.page {
+							needs_redraw = true;
+						}
+					},
 					Err(e) => tui.show_error(e),
 				}
-				true
 			},
 		};
 
-		let new_area = Tui::main_layout(&term.get_frame());
+		let new_area = Tui::main_layout(&term.get_frame(), fullscreen);
 		if new_area != main_area {
 			main_area = new_area;
-			tui_tx.send(RenderNotif::Area(main_area[1]))?;
+			to_renderer.send(RenderNotif::Area(main_area.page_area))?;
 			needs_redraw = true;
 		}
 
 		if needs_redraw {
+			let mut to_display = KittyDisplay::NoChange;
 			term.draw(|f| {
-				tui.render(f, &main_area);
+				to_display = tui.render(f, &main_area, font_size);
 			})?;
-			execute!(stdout(), EndSynchronizedUpdate)?;
+
+			let maybe_err = display_kitty_images(to_display, &mut ev_stream, tmux_offset).await;
+
+			if let Err((to_replace, err_desc, enum_err)) = maybe_err {
+				match enum_err {
+					// This is the error that kitty & ghostty provide us when they delete an
+					// image due to memory constraints, so if we get it, we just fix it by
+					// re-rendering so it don't display it to the user
+					//
+					// [TODO] maybe when we detect that an image was deleted, we probe the
+					// terminal for the pages around it to see if they were deleted too and if
+					// they were, we re-render them? idk
+					TransmitError::Terminal(TerminalError::NoEntity(_)) => (),
+					_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+						"{err_desc}: {enum_err}"
+					))))
+				}
+
+				for page_num in to_replace {
+					tui.page_failed_display(page_num);
+					// So that they get re-rendered and sent over again
+					to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+				}
+			}
+
+			execute!(stdout().lock(), EndSynchronizedUpdate)?;
 		}
 	}
-
-	execute!(
-		term.backend_mut(),
-		LeaveAlternateScreen,
-		crossterm::cursor::Show
-	)?;
-	disable_raw_mode()?;
-
-	Ok(())
 }
 
-fn noop(_: LogLevel, _: &[LogField<'_>]) -> LogWriterOutput {
-	LogWriterOutput::Handled
+fn on_notify_ev(
+	to_tui_tx: flume::Sender<Result<RenderInfo, RenderError>>,
+	to_render_tx: flume::Sender<RenderNotif>,
+	file_name: OsString,
+	debounce_delay: Duration
+) -> impl Fn(notify::Result<Event>) {
+	let last_event: Mutex<Result<(), RenderError>> = Mutex::new(Ok(()));
+	let last_event = Arc::new(last_event);
+
+	let debouncer = EventDebouncer::new(debounce_delay, {
+		let last_event = last_event.clone();
+		move |()| {
+			let event = mem::replace(&mut *last_event.lock().unwrap(), Ok(()));
+			match event {
+				// This shouldn't fail to send unless the receiver gets disconnected. If that's
+				// happened, then like the main thread has panicked or something, so it doesn't matter
+				// we don't handle the error here.
+				Ok(()) => to_render_tx.send(RenderNotif::Reload).unwrap(),
+				// If we get an error here, and then an error sending, everything's going wrong. Just give
+				// up lol.
+				Err(e) => to_tui_tx.send(Err(e)).unwrap()
+			}
+		}
+	});
+
+	move |res| {
+		let event = match res {
+			Err(e) => Err(RenderError::Notify(e)),
+
+			// TODO: Should we match EventKind::Rename and propogate that so that the other parts of the
+			// process know that too? Or should that be
+			Ok(ev) => {
+				// We only watch the parent directory (see the comment above `watcher.watch` in `fn
+				// main`) so we need to filter out events to only ones that pertain to the single file
+				// we care about
+				if !ev
+					.paths
+					.iter()
+					.any(|path| path.file_name().is_some_and(|f| f == file_name))
+				{
+					return;
+				}
+
+				match ev.kind {
+					EventKind::Access(_) => return,
+					EventKind::Remove(_) => Err(RenderError::Converting("File was deleted".into())),
+					EventKind::Other
+					| EventKind::Any
+					| EventKind::Create(_)
+					| EventKind::Modify(_) => Ok(())
+				}
+			}
+		};
+		*last_event.lock().unwrap() = event;
+		debouncer.put(());
+	}
+}
+
+fn parse_color_to_i32(cs: &str) -> Result<i32, csscolorparser::ParseColorError> {
+	let color = csscolorparser::parse(cs)?;
+	let [r, g, b, _] = color.to_rgba8();
+	Ok(i32::from_be_bytes([0, r, g, b]))
+}
+
+/// Query tmux for the current pane's position (col, row) within the underlying terminal.
+fn get_tmux_pane_offset() -> Option<(u16, u16)> {
+	let output = std::process::Command::new("tmux")
+		.args(["display-message", "-p", "#{pane_left}:#{pane_top}"])
+		.output()
+		.ok()?;
+	let s = std::str::from_utf8(&output.stdout).ok()?.trim();
+	let (left, top) = s.split_once(':')?;
+	Some((left.parse().ok()?, top.parse().ok()?))
+}
+
+fn get_font_size_through_stdio() -> Result<(u16, u16), WrappedErr> {
+	// send the command code to get the terminal window size
+	print!("\x1b[14t");
+	std::io::stdout().flush().unwrap();
+
+	// we need to enable raw mode here since this bit of output won't print a newline; it'll
+	// just print the info it wants to tell us. So we want to get all characters as they come
+	enable_raw_mode().map_err(|e| {
+		WrappedErr(
+			format!("Can't enable raw mode, which is necessary to receive input: {e}").into()
+		)
+	})?;
+
+	// read in the returned size until we hit a 't' (which indicates to us it's done)
+	let input_vec = BufReader::new(std::io::stdin())
+		.bytes()
+		.filter_map(Result::ok)
+		.take_while(|b| *b != b't')
+		.collect::<Vec<_>>();
+
+	// and then disable raw mode again in case we return an error in this next section
+	disable_raw_mode().map_err(|e| {
+		WrappedErr(format!("Can't put the terminal back into a normal input state: {e}").into())
+	})?;
+
+	let input_line = String::from_utf8(input_vec).map_err(|e| {
+		WrappedErr(
+			format!(
+				"The terminal responded to our request for its font size by providing non-utf8 data: {e}"
+			)
+			.into()
+		)
+	})?;
+	let input_line = input_line
+		.trim_start_matches("\x1b[4")
+		.trim_start_matches(';');
+
+	// it should input it to us as `\e[4;<height>;<width>t`, so we need to split to get the h/w
+	// ignore the first val
+	let mut splits = input_line.split([';', 't']);
+
+	let (Some(h), Some(w)) = (splits.next(), splits.next()) else {
+		return Err(WrappedErr(
+			format!("Terminal responded with unparseable size response '{input_line}'").into()
+		));
+	};
+
+	let h = h.parse::<u16>().map_err(|e| {
+		WrappedErr(
+			format!(
+				"Your terminal said its height is {h}, but that is not a 16-bit unsigned integer: {e}"
+			)
+			.into()
+		)
+	})?;
+	let w = w.parse::<u16>().map_err(|e| {
+		WrappedErr(
+			format!(
+				"Your terminal said its width is {w}, but that is not a 16-bit unsigned integer: {e}"
+			)
+			.into()
+		)
+	})?;
+
+	Ok((w, h))
 }

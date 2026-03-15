@@ -1,23 +1,19 @@
-use std::{
-    hint::black_box,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{hint::black_box, path::Path};
 
 use crossterm::terminal::WindowSize;
-use flume::{r#async::RecvStream, unbounded, Sender};
+use flume::{Sender, r#async::RecvStream, unbounded};
 use futures_util::stream::StreamExt as _;
 use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
 use tdf::{
-	converter::{run_conversion_loop, ConvertedPage, ConverterMsg},
-	renderer::{fill_default, start_rendering, RenderError, RenderInfo, RenderNotif}
+	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
+	renderer::{RenderError, RenderInfo, RenderNotif, fill_default, start_rendering}
 };
 
 pub fn handle_renderer_msg(
 	msg: Result<RenderInfo, RenderError>,
 	pages: &mut Vec<Option<ConvertedPage>>,
-	to_converter_tx: &mut Sender<tdf::converter::ConverterMsg>
+	to_converter_tx: &Sender<tdf::converter::ConverterMsg>
 ) {
 	match msg {
 		Ok(RenderInfo::NumPages(num)) => {
@@ -25,6 +21,8 @@ pub fn handle_renderer_msg(
 			to_converter_tx.send(ConverterMsg::NumPages(num)).unwrap();
 		}
 		Ok(RenderInfo::Page(info)) => to_converter_tx.send(ConverterMsg::AddImg(info)).unwrap(),
+		// We can ignore the these variants 'cause they're only used to send info to the TUI
+		Ok(RenderInfo::Reloaded | RenderInfo::SearchResults { .. }) => (),
 		Err(e) => panic!("Got error from renderer: {e:?}")
 	}
 }
@@ -32,20 +30,20 @@ pub fn handle_renderer_msg(
 pub fn handle_converter_msg(
 	msg: Result<ConvertedPage, RenderError>,
 	pages: &mut [Option<ConvertedPage>],
-	to_converter_tx: &mut Sender<ConverterMsg>
+	to_converter_tx: &Sender<ConverterMsg>
 ) {
 	let page = msg.expect("Got error from converter");
 	let num = page.num;
 
 	pages[num] = Some(page);
 
-	let num_got = pages.iter().filter(|p| p.is_some()).count();
+	let first_none = pages.iter().position(Option::is_none);
 
 	// we have to tell it to jump to a certain page so that it will actually render it (since
 	// it only renders fanning out from the page that we currently have selected)
-	to_converter_tx
-		.send(ConverterMsg::GoToPage(num_got))
-		.unwrap();
+	if let Some(first) = first_none {
+		to_converter_tx.send(ConverterMsg::GoToPage(first)).unwrap();
+	}
 }
 
 pub struct RenderState {
@@ -60,15 +58,13 @@ const FONT_SIZE: (u16, u16) = (8, 14);
 
 pub fn start_rendering_loop(
 	path: impl AsRef<Path>,
-    zoom_level: Arc<Mutex<f64>>,
-    offset: Arc<Mutex<(f64, f64)>>,
-    multipage_mode: bool
+	black: i32,
+	white: i32
 ) -> (
 	RecvStream<'static, Result<RenderInfo, RenderError>>,
 	Sender<RenderNotif>
 ) {
 	let pathbuf = path.as_ref().canonicalize().unwrap();
-	let str_path = format!("file://{}", pathbuf.into_os_string().to_string_lossy());
 
 	let (to_render_tx, from_main_rx) = unbounded();
 	let (to_main_tx, from_render_rx) = unbounded();
@@ -82,8 +78,6 @@ pub fn start_rendering_loop(
 		width: columns * FONT_SIZE.0
 	};
 
-	std::thread::spawn(move || start_rendering(str_path, to_main_tx, from_main_rx, size, zoom_level, offset, multipage_mode));
-
 	let main_area = Rect {
 		x: 0,
 		y: 0,
@@ -92,11 +86,28 @@ pub fn start_rendering_loop(
 	};
 	to_render_tx.send(RenderNotif::Area(main_area)).unwrap();
 
+	let cell_height_px = size.height / size.rows;
+	let cell_width_px = size.width / size.columns;
+	std::thread::spawn(move || {
+		start_rendering(
+			&pathbuf,
+			to_main_tx,
+			from_main_rx,
+			cell_height_px,
+			cell_width_px,
+			tdf::PrerenderLimit::All,
+			black,
+			white
+		)
+	});
+
 	let from_render_rx = from_render_rx.into_stream();
 	(from_render_rx, to_render_tx)
 }
 
+#[must_use]
 pub fn start_converting_loop(
+	proto: ProtocolType,
 	prerender: usize
 ) -> (
 	RecvStream<'static, Result<ConvertedPage, RenderError>>,
@@ -105,14 +116,17 @@ pub fn start_converting_loop(
 	let (to_converter_tx, from_main_rx) = unbounded();
 	let (to_main_tx, from_converter_rx) = unbounded();
 
-	let mut picker = Picker::new(FONT_SIZE);
-	picker.protocol_type = ProtocolType::Kitty;
+	#[expect(deprecated)]
+	let mut picker = Picker::from_fontsize(FONT_SIZE);
+	picker.set_protocol_type(proto);
 
 	tokio::spawn(run_conversion_loop(
 		to_main_tx,
 		from_main_rx,
 		picker,
-		prerender
+		prerender,
+		// just assume shms work for now, who cares
+		true
 	));
 
 	let from_converter_rx = from_converter_rx.into_stream();
@@ -120,13 +134,13 @@ pub fn start_converting_loop(
 }
 
 pub fn start_all_rendering(
-    path: impl AsRef<Path>,
-    zoom_level: Arc<Mutex<f64>>,
-    offset: Arc<Mutex<(f64, f64)>>,
-    multipage_mode: bool
+	path: impl AsRef<Path>,
+	black: i32,
+	white: i32,
+	proto: ProtocolType
 ) -> RenderState {
-	let (from_render_rx, to_render_tx) = start_rendering_loop(path, zoom_level, offset, multipage_mode);
-	let (from_converter_rx, to_converter_tx) = start_converting_loop(20);
+	let (from_render_rx, to_render_tx) = start_rendering_loop(path, black, white);
+	let (from_converter_rx, to_converter_tx) = start_converting_loop(proto, 20);
 
 	let pages: Vec<Option<ConvertedPage>> = Vec::new();
 
@@ -140,26 +154,33 @@ pub fn start_all_rendering(
 }
 
 pub async fn render_doc(
-    path: impl AsRef<Path>,
-    zoom_level: Arc<Mutex<f64>>,
-    offset: Arc<Mutex<(f64, f64)>>,
-    multipage_mode: bool
+	path: impl AsRef<Path>,
+	search_term: Option<&str>,
+	black: i32,
+	white: i32,
+	proto: ProtocolType
 ) {
 	let RenderState {
 		mut from_render_rx,
 		mut from_converter_rx,
 		mut pages,
-		mut to_converter_tx,
+		to_converter_tx,
 		to_render_tx
-	} = start_all_rendering(path, zoom_level, offset, multipage_mode);
+	} = start_all_rendering(path, black, white, proto);
 
-	while pages.is_empty() || pages.iter().any(|p| p.is_none()) {
+	if let Some(term) = search_term {
+		to_render_tx
+			.send(RenderNotif::Search(term.to_owned()))
+			.unwrap();
+	}
+
+	while pages.is_empty() || pages.iter().any(Option::is_none) {
 		tokio::select! {
 			Some(renderer_msg) = from_render_rx.next() => {
-				handle_renderer_msg(renderer_msg, &mut pages, &mut to_converter_tx);
+				handle_renderer_msg(renderer_msg, &mut pages, &to_converter_tx);
 			},
 			Some(converter_msg) = from_converter_rx.next() => {
-				handle_converter_msg(converter_msg, &mut pages, &mut to_converter_tx);
+				handle_converter_msg(converter_msg, &mut pages, &to_converter_tx);
 			}
 		}
 	}

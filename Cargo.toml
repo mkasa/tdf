@@ -1,38 +1,57 @@
 [package]
-name = "tdf"
-version = "0.1.0"
-edition = "2021"
-license = "MPL-2.0"
+name = "tdf-viewer"
+version = "0.5.0"
+authors = ["June Welker <junewelker@gmail.com>"]
+edition = "2024"
+description = "A terminal viewer for PDFs"
+readme = "README.md"
+homepage = "https://github.com/itsjunetime/tdf"
+repository = "https://github.com/itsjunetime/tdf"
+license = "AGPL-3.0-only"
+keywords = ["pdf", "tui", "cli", "terminal"]
+categories = ["command-line-utilities", "text-processing", "visualization"]
 default-run = "tdf"
+rust-version = "1.86"
 
 [[bin]]
 name = "tdf"
+path = "src/main.rs"
 
 # lib only exists for benching
 [lib]
 name = "tdf"
 
 [dependencies]
-poppler-rs = { version = "0.24.0", default-features = false, features = ["v23_7"] }
-cairo-rs = { version = "0.20.0", default-features = false, features = ["png"] }
 # we're using this branch because it has significant performance fixes that I'm waiting on responses from the upstream devs to get upstreamed. See https://github.com/ratatui-org/ratatui/issues/1116
-ratatui = { git = "https://github.com/itsjunetime/ratatui.git" }
-# ratatui = { path = "./ratatui" }
-# We're using this to have the vb64 feature (for faster base64 encoding, since that does take up a good bit of time when converting images to the Box<dyn ratatui_image::Protocol>. It also just includes a few more features that I'm waiting on main to upstream
-ratatui-image = { git = "https://github.com/itsjunetime/ratatui-image.git", branch = "vb64_on_personal", features = ["rustix", "vb64"], default-features = false }
-# ratatui-image = { path = "./ratatui-image", features = ["rustix", "vb64"], default-features = false }
-crossterm = { version = "0.27.0", features = ["event-stream"] }
-image = { version = "0.25.1", features = ["png", "rayon"], default-features = false }
-notify = "6.1.1"
+ratatui = { git = "https://github.com/itsjunetime/ratatui.git", rev = "720ac2d0cad1ac6424364fea74856fec9c100cb1", default-features = false, features = [ "crossterm", "layout-cache" ] }
+# ratatui = { path = "./ratatui/ratatui/" }
+# We're using this to have the vb64 feature (for faster base64 encoding, since that does take up a good bit of time when converting images to the `Protocol`. It also just includes a few more features that I'm waiting on main to upstream
+ratatui-image = { git = "https://github.com/itsjunetime/ratatui-image.git", rev = "a276a87cb8e2976442c6cc59db831db81551da89", default-features = false }
+# ratatui-image = { path = "./ratatui-image", default-features = false }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+# crossterm = { path = "../crossterm", features = ["event-stream"] }
+image = { version = "0.25.1", features = ["pnm", "rayon", "png"], default-features = false }
+notify = { version = "8.0.0", features = ["crossbeam-channel"] }
 tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros"] }
 futures-util = { version = "0.3.30", default-features = false }
-glib = "0.20.0"
-itertools = "*"
-flume = { version = "0.11.0", default-features = false, features = ["async"] }
+flume = { version = "0.12.0", default-features = false, features = ["async"] }
+xflags = "0.4.0-pre.2"
+mimalloc = "0.1.43"
+nix = { version = "0.31.0", features = ["signal"] }
+mupdf = { git = "https://github.com/messense/mupdf-rs.git", rev = "d7441b9998c92135e329559c0aa71d9dc92cf4de", default-features = false, features = ["svg", "system-fonts", "img"] }
+rayon = { version = "1", default-features = false }
+# kittage = { path = "../kittage/", features = ["crossterm-tokio", "image-crate", "log"] }
+kittage = { version = "0.3.4", features = ["crossterm-tokio", "image-crate", "log"] }
+memmap2 = "0"
+csscolorparser = { version = "0.8.0", default-features = false }
+debounce = "0.2.2"
+
+# logging
+log = "0.4.27"
+flexi_logger = "0.31"
 
 # for tracing with tokio-console
-console-subscriber = { version = "0.3.0", optional = true }
-clap = "4.5.9"
+console-subscriber = { version = "0.5.0", optional = true }
 
 [profile.production]
 inherits = "release"
@@ -41,9 +60,11 @@ lto = "fat"
 [features]
 default = []
 tracing = ["tokio/tracing", "dep:console-subscriber"]
+epub = ["mupdf/epub"]
+cbz = ["mupdf/cbz"]
 
 [dev-dependencies]
-criterion = { version = "0.5.1", features = ["async_tokio"] }
+criterion = { version = "0.8.0", features = ["async_tokio"] }
 cpuprofiler = "0.0.4"
 
 [[bench]]
@@ -53,3 +74,207 @@ harness = false
 [[bin]]
 name = "for_profiling"
 path = "./benches/for_profiling.rs"
+
+[lints.clippy]
+alloc_instead_of_core = "warn"
+allow_attributes = "warn"
+as_pointer_underscore = "warn"
+as_ptr_cast_mut = "warn"
+as_underscore = "warn"
+assigning_clones = "warn"
+assertions_on_result_states = "warn"
+bool_to_int_with_if = "warn"
+borrow_as_ptr = "warn"
+branches_sharing_code = "warn"
+cargo_common_metadata = "warn"
+case_sensitive_file_extension_comparisons = "warn"
+cast_lossless = "warn"
+cast_ptr_alignment = "warn"
+cfg_not_test = "warn"
+checked_conversions = "warn"
+clear_with_drain = "warn"
+cloned_instead_of_copied = "warn"
+coerce_container_to_any = "warn"
+comparison_chain = "warn"
+copy_iterator = "warn"
+create_dir = "warn"
+debug_assert_with_mut_call = "warn"
+decimal_literal_representation = "warn"
+default_trait_access = "warn"
+deref_by_slicing = "warn"
+doc_broken_link = "warn"
+doc_link_code = "warn"
+doc_link_with_quotes = "warn"
+elidable_lifetime_names = "warn"
+empty_drop = "warn"
+empty_enums = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+equatable_if_let = "warn"
+error_impl_error = "warn"
+expl_impl_clone_on_copy = "warn"
+explicit_deref_methods = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+fallible_impl_from = "warn"
+filetype_is_file = "warn"
+filter_map_next = "warn"
+flat_map_option = "warn"
+fn_to_numeric_cast_any = "warn"
+fn_params_excessive_bools = "warn"
+format_collect = "warn"
+format_push_string = "warn"
+get_unwrap = "warn"
+if_then_some_else_none = "warn"
+ignore_without_reason = "warn"
+ignored_unit_patterns = "warn"
+implicit_clone = "warn"
+imprecise_flops = "warn"
+index_refutable_slice = "warn"
+indexing_slicing = "allow" # can't warn on this cause we basically have to do indexing for some ratatui apis
+infinite_loop = "warn"
+invalid_upcast_comparisons = "warn"
+ip_constant = "warn"
+iter_filter_is_ok = "warn"
+iter_filter_is_some = "warn"
+iter_not_returning_iterator = "warn"
+iter_on_empty_collections = "warn"
+iter_on_single_items = "warn"
+large_digit_groups = "warn"
+large_futures = "warn"
+large_include_file = "warn"
+large_stack_frames = "warn"
+large_types_passed_by_value = "warn"
+linkedlist = "warn"
+literal_string_with_formatting_args = "warn"
+lossy_float_literal = "warn"
+macro_use_imports = "warn"
+manual_assert = "warn"
+manual_instant_elapsed = "warn"
+manual_is_power_of_two = "warn"
+manual_is_variant_and = "warn"
+manual_let_else = "warn"
+manual_midpoint = "warn"
+manual_ok_or = "warn"
+many_single_char_names = "warn"
+map_err_ignore = "warn"
+map_unwrap_or = "warn"
+map_with_unused_argument_over_ranges = "warn"
+match_same_arms = "warn"
+match_wild_err_arm = "warn"
+match_wildcard_for_single_variants = "warn"
+maybe_infinite_iter = "warn"
+mem_forget = "warn"
+mismatching_type_param_order = "warn"
+missing_assert_message = "warn"
+missing_fields_in_debug = "warn"
+mixed_read_write_in_expression = "warn"
+multiple_unsafe_ops_per_block = "warn"
+must_use_candidate = "warn"
+mut_mut = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+naive_bytecount = "warn"
+needless_bitwise_bool = "warn"
+needless_collect = "warn"
+needless_continue = "warn"
+needless_for_each = "warn"
+needless_pass_by_ref_mut = "warn"
+needless_pass_by_value = "warn"
+needless_raw_string_hashes = "warn"
+needless_raw_strings = "warn"
+negative_feature_names = "warn"
+no_effect_underscore_binding = "warn"
+no_mangle_with_rust_abi = "warn"
+non_send_fields_in_send_ty = "warn"
+non_std_lazy_statics = "warn"
+non_zero_suggestions = "warn"
+nonstandard_macro_braces = "warn"
+option_as_ref_cloned = "warn"
+option_option = "warn"
+or_fun_call = "warn"
+path_buf_push_overwrite = "warn"
+pathbuf_init_then_push = "warn"
+precedence_bits = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+pub_underscore_fields = "warn"
+pub_without_shorthand = "warn"
+range_minus_one = "warn"
+range_plus_one = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+read_zero_byte_vec = "warn"
+redundant_clone = "warn"
+redundant_closure_for_method_calls = "warn"
+redundant_else = "warn"
+redundant_pub_crate = "warn"
+redundant_test_prefix = "warn"
+ref_as_ptr = "warn"
+ref_binding_to_reference = "warn"
+ref_option = "warn"
+ref_option_ref = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+return_self_not_must_use = "warn"
+same_functions_in_if_condition = "warn"
+self_named_module_files = "warn"
+semicolon_if_nothing_returned = "warn"
+semicolon_inside_block = "warn"
+should_panic_without_expect = "warn"
+significant_drop_in_scrutinee = "warn" # I thought this was fixed in the 2024 edition. watever
+significant_drop_tightening = "warn"
+single_char_pattern = "warn"
+single_option_map = "warn"
+stable_sort_primitive = "warn"
+str_split_at_newline = "warn"
+string_lit_as_bytes = "warn"
+string_lit_chars_any = "warn"
+string_slice = "warn"
+struct_excessive_bools = "warn"
+struct_field_names = "warn"
+suboptimal_flops = "warn"
+suspicious_operation_groupings = "warn"
+suspicious_xor_used_as_pow = "warn"
+tests_outside_test_module = "warn"
+trait_duplication_in_bounds = "warn"
+transmute_ptr_to_ptr = "warn"
+trivial_regex = "warn"
+trivially_copy_pass_by_ref = "warn"
+try_err = "warn"
+tuple_array_conversions = "warn"
+type_repetition_in_bounds = "warn"
+unchecked_time_subtraction = "warn"
+undocumented_unsafe_blocks = "warn"
+unicode_not_nfc = "warn"
+uninhabited_references = "warn"
+uninlined_format_args = "warn"
+unnecessary_box_returns = "warn"
+unnecessary_debug_formatting = "warn"
+unnecessary_join = "warn"
+unnecessary_literal_bound = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_self_imports = "warn"
+unnecessary_semicolon = "warn"
+unnecessary_struct_initialization = "warn"
+unnecessary_wraps = "warn"
+unnested_or_patterns = "warn"
+unreadable_literal = "warn"
+unsafe_derive_deserialize = "warn"
+unused_async = "warn"
+unused_peekable = "warn"
+unused_result_ok = "warn"
+unused_rounding = "warn"
+unused_self = "warn"
+unused_trait_names = "warn"
+use_self = "warn"
+used_underscore_binding = "warn"
+used_underscore_items = "warn"
+useless_let_if_seq = "warn"
+verbose_bit_mask = "warn"
+verbose_file_reads = "warn"
+volatile_composites = "warn"
+while_float = "warn"
+wildcard_dependencies = "warn"
+wildcard_imports = "warn"
+zero_sized_map_values = "warn"

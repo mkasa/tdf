@@ -1,80 +1,81 @@
-use std::{
-    thread,
-    sync::{Arc, Mutex},
-    fs::OpenOptions,
-    io::prelude::*,
-};
+use std::{collections::VecDeque, num::NonZeroUsize, path::Path, thread::sleep, time::Duration};
 
-use cairo::{Antialias, Context, Format, Surface};
-use crossterm::terminal::WindowSize;
 use flume::{Receiver, SendError, Sender, TryRecvError};
-use itertools::Itertools;
-use poppler::{Color, Document, FindFlags, Page, Rectangle, SelectionStyle};
+use mupdf::{
+	Colorspace, Document, Matrix, Page, Pixmap, Quad, TextPageFlags, text_page::SearchHitResponse
+};
 use ratatui::layout::Rect;
 
+use crate::{
+	FitOrFill, PrerenderLimit, ScaledResult, scale_img_for_area, skip::InterleavedAroundWithMax
+};
+
+const KITTY_MAX_W_OR_H: f32 = 10_000.0;
+
+#[derive(Debug)]
 pub enum RenderNotif {
 	Area(Rect),
 	JumpToPage(usize),
+	PageNeedsReRender(usize),
 	Search(String),
-    ZoomLevelChange,
-	Reload
+	SwitchFitOrFill(FitOrFill),
+	Reload,
+	Invert,
+	Rotate
 }
 
 #[derive(Debug)]
 pub enum RenderError {
-	Doc(glib::Error),
-	// Don't like storing an error as a string but it needs to be Send to send to the main thread,
-	// and it's just going to be shown to the user, so whatever
-	Render(String)
+	Notify(notify::Error),
+	Doc(mupdf::error::Error),
+	Converting(String)
 }
 
 pub enum RenderInfo {
 	NumPages(usize),
-	Page(PageInfo)
+	Page(PageInfo),
+	SearchResults { page_num: usize, num_results: usize },
+	Reloaded
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum RotateDirection {
+	Deg0,
+	Deg90,
+	Deg180,
+	Deg270
 }
 
 #[derive(Clone)]
 pub struct PageInfo {
 	pub img_data: ImageData,
-	pub page: usize,
-	pub search_results: usize
+	pub page_num: usize,
+	pub result_rects: Vec<HighlightRect>
 }
 
 #[derive(Clone)]
 pub struct ImageData {
-	pub data: Vec<u8>,
-	pub area: Rect
+	pub pixels: Vec<u8>,
+	pub cell_w: u16,
+	pub cell_h: u16
 }
 
 #[derive(Default)]
 struct PrevRender {
 	successful: bool,
-	contained_term: Option<bool>
+	num_search_found: Option<usize>
 }
 
-fn log_message_to_file(msg: String) -> () {
-    #[cfg(debug_assertions)]
-    {
-        let mut file = match OpenOptions::new().create(true).append(true).open("/tmp/zoom_level.txt") {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Couldn't open zoom_level.txt: {}", e);
-                return
-            }
-        };
-        file.write_all(msg.as_bytes());
-    }
-}
+pub const MUPDF_BLACK: i32 = 0;
+pub const MUPDF_WHITE: i32 = i32::from_be_bytes([0, 0xff, 0xff, 0xff]);
 
+#[inline]
 pub fn fill_default<T: Default>(vec: &mut Vec<T>, size: usize) {
 	vec.clear();
-	vec.reserve(size.saturating_sub(vec.len()));
-	for _ in 0..size {
-		vec.push(T::default());
-	}
+	vec.resize_with(size, T::default);
 }
 
-// this function has to be sync (non-async) because the poppler::Document needs to be held during
+// this function has to be sync (non-async) because the mupdf::Document needs to be held during
 // most of it, but that's basically just a wrapper around `*c_void` cause it's just a binding to C
 // code, so it's !Send and thus can't be held across await points. So we can't call any of the
 // async `send` or `recv` methods in this function body, since those create await points. Which
@@ -83,52 +84,98 @@ pub fn fill_default<T: Default>(vec: &mut Vec<T>, size: usize) {
 // Also we just kinda 'unwrap' all of the send/recv calls here 'cause if they return an error, that
 // means the other side's disconnected, which means that the main thread has panicked, which means
 // we're done.
+// We're allowing passing by value here because this is only called once, at the beginning of the
+// program, and the arguments that 'should' be passed by value (`receiver` and `size`) would
+// probably be more performant if accessed by-value instead of through a reference. Probably.
+#[expect(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn start_rendering(
-	path: String,
-	mut sender: Sender<Result<RenderInfo, RenderError>>,
+	path: &Path,
+	sender: Sender<Result<RenderInfo, RenderError>>,
 	receiver: Receiver<RenderNotif>,
-	size: WindowSize,
-    zoom_level: Arc<Mutex<f64>>,
-    offset: Arc<Mutex<(f64, f64)>>,
-    multipage_mode: bool
+	col_h: u16,
+	col_w: u16,
+	prerender: PrerenderLimit,
+	black: i32,
+	white: i32
 ) -> Result<(), SendError<Result<RenderInfo, RenderError>>> {
-	// first, wait 'til we get told what the current starting area is so that we can set it to
-	// know what to render to
-	let mut area;
-	loop {
-		if let RenderNotif::Area(r) = receiver.recv().unwrap() {
-			area = r;
-			break;
-		}
-	}
-
 	// We want this outside of 'reload so that if the doc reloads, the search term that somebody
 	// set will still get highlighted in the reloaded doc
 	let mut search_term = None;
 
-    let mut serial_counter = 0;
-
 	// And although the font size could theoretically change, we aren't accounting for that right
-	// now, so we just keep this out of the loop.
-	let col_w = size.width / size.columns;
-	let col_h = size.height / size.rows;
+	// now, so we just use the values passed in.
+
+	let mut stored_doc = None;
+	let mut invert = false;
+	let mut rotate = RotateDirection::Deg0;
+	let mut preserved_area = None;
+	let mut fit_or_fill = FitOrFill::Fit;
+
+	let mut need_rerender = VecDeque::new();
+
+	#[cfg(windows)]
+	let path = path.to_string_lossy();
 
 	'reload: loop {
-		let doc = match Document::from_file(&path, None) {
-			Err(e) => return sender.send(Err(RenderError::Doc(e))),
-			Ok(d) => d
+		// Need to do this weird borrow thing so that we convert `Cow<'_, str>` -> `&str` on windows
+		// and keep unix a `&Path` -> `&Path` 'cause there are different requirements within mupdf
+		// about file paths per-platform
+		#[cfg_attr(unix, expect(clippy::borrow_deref_ref))]
+		let doc = match Document::open(&*path) {
+			Err(e) => {
+				// if there's an error, tell the main loop
+				sender.send(Err(RenderError::Doc(e)))?;
+
+				match stored_doc {
+					Some(ref d) => d,
+					None => {
+						// then wait for a reload notif (since what probably happened is that the file was
+						// temporarily removed to facilitate a save or something like that)
+						while let Ok(msg) = receiver.recv() {
+							// and once that comes, just try to reload again
+							if matches!(msg, RenderNotif::Reload) {
+								continue 'reload;
+							}
+						}
+						// if that while let Ok ever fails and we exit out of that loop, the main thread is
+						// done, so we're fine to just return
+						return Ok(());
+					}
+				}
+			}
+			Ok(d) => {
+				if stored_doc.is_some() {
+					sender.send(Ok(RenderInfo::Reloaded))?;
+				}
+				&*stored_doc.insert(d)
+			}
 		};
 
-		let n_pages = doc.n_pages() as usize;
-		sender.send(Ok(RenderInfo::NumPages(n_pages)))?;
+		let n_pages = match doc.page_count() {
+			Ok(n) => match NonZeroUsize::new(n as usize) {
+				Some(n) => n,
+				None => {
+					sleep(Duration::from_secs(1));
+					continue 'reload;
+				}
+			},
+			Err(e) => {
+				sender.send(Err(RenderError::Doc(e)))?;
+				// just basic backoff i think
+				sleep(Duration::from_secs(1));
+				continue 'reload;
+			}
+		};
 
-		// We're using this vec of bools to indicate which page numbers have already been rendered,
-		// to support people jumping to specific pages and having quick rendering results. We
+		sender.send(Ok(RenderInfo::NumPages(n_pages.get())))?;
+
+		// We're using this vec to indicate which page numbers have already been rendered, to
+		// support people jumping to specific pages and having quick rendering results. We
 		// `split_at_mut` at 0 initially (which bascially makes `right == rendered && left == []`),
 		// doing basically nothing, but if we get a notification that something has been jumped to,
 		// then we can split at that page and render at both sides of it
-		let mut rendered = vec![];
-		fill_default::<PrevRender>(&mut rendered, n_pages);
+		let mut rendered = Vec::new();
+		fill_default::<PrevRender>(&mut rendered, n_pages.get());
 		let mut start_point = 0;
 
 		// This is kinda a weird way of doing this, but if we get a notification that the area
@@ -136,32 +183,52 @@ pub fn start_rendering(
 		// document. If there was a mechanism to say 'start this for-loop over' then I would do
 		// that, but I don't think such a thing exists, so this is our attempt
 		'render_pages: loop {
+			// next, we gotta wait 'til we get told what the current starting area is so that we can
+			// set it to know what to render to
+			let area = preserved_area.unwrap_or_else(|| {
+				let new_area = loop {
+					if let RenderNotif::Area(r) = receiver.recv().unwrap() {
+						break r;
+					}
+				};
+				preserved_area = Some(new_area);
+				new_area
+			});
+
+			let area_w = f32::from(area.width) * f32::from(col_w);
+			let area_h = f32::from(area.height) * f32::from(col_h);
+
 			// what we do with a notif is the same regardless of if we're in the middle of
 			// rendering the list of pages or we're all done
 			macro_rules! handle_notif {
-				($notif:ident) => {
+				($notif:ident) => {{
 					match $notif {
 						RenderNotif::Reload => continue 'reload,
-						RenderNotif::Area(new_area) => {
-							let bigger =
-								new_area.width > area.width || new_area.height > area.height;
-							area = new_area;
-							// we only want to re-render pages if the new area is greater than the old
-							// one, 'cause then we might need sharper images to make it all look good.
-							// If the new area is smaller, then the same high-quality-rendered images
-							// will still look fine, so it's ok to leave it.
-							if bigger {
-								fill_default(&mut rendered, n_pages);
-								continue 'render_pages;
+						RenderNotif::Invert => {
+							invert = !invert;
+							for page in &mut rendered {
+								page.successful = false;
 							}
+							continue 'render_pages;
 						}
-                        RenderNotif::ZoomLevelChange => {
-                            log_message_to_file(format!("Zoom level changed to {}\n",zoom_level.lock().unwrap().clone()));
-                            log_message_to_file(format!("Offset changed to {:?}\n",offset.lock().unwrap().clone()));
-                            continue 'reload;
-                        }
+						RenderNotif::Area(new_area) => {
+							preserved_area = Some(new_area);
+							fill_default(&mut rendered, n_pages.get());
+							continue 'render_pages;
+						}
+						RenderNotif::SwitchFitOrFill(f_or_f) =>
+							if f_or_f != fit_or_fill {
+								fit_or_fill = f_or_f;
+								fill_default(&mut rendered, n_pages.get());
+								continue 'render_pages;
+							},
 						RenderNotif::JumpToPage(page) => {
 							start_point = page;
+							continue 'render_pages;
+						}
+						RenderNotif::PageNeedsReRender(page) => {
+							rendered[page].successful = false;
+							need_rerender.push_back(page);
 							continue 'render_pages;
 						}
 						RenderNotif::Search(term) => {
@@ -170,7 +237,8 @@ pub fn start_rendering(
 								// the pages wherein there were already no search results. So this
 								// is a little optimization to allow that.
 								for page in &mut rendered {
-									if !page.successful || page.contained_term != Some(true) {
+									if page.num_search_found.is_some_and(|n| n > 0) {
+										page.num_search_found = Some(0);
 										page.successful = false;
 									}
 								}
@@ -181,41 +249,119 @@ pub fn start_rendering(
 								// term, we can render them with the term, but if they don't, we
 								// don't need to re-render and send it over again.
 								for page in &mut rendered {
-									page.contained_term = None;
+									page.num_search_found = None;
 								}
 								search_term = Some(term);
 							}
 							continue 'render_pages;
 						}
+						RenderNotif::Rotate => {
+							rotate = match rotate {
+								RotateDirection::Deg0 => RotateDirection::Deg90,
+								RotateDirection::Deg90 => RotateDirection::Deg180,
+								RotateDirection::Deg180 => RotateDirection::Deg270,
+								RotateDirection::Deg270 => RotateDirection::Deg0
+							};
+							for page in &mut rendered {
+								page.successful = false;
+							}
+							continue 'render_pages;
+						}
 					}
-				};
+				}};
 			}
 
-			let (left, right) = rendered.split_at_mut(start_point);
+			let any_not_searched = rendered.iter().any(|r| r.num_search_found.is_none());
 
-			let page_iter = right
-				.iter_mut()
-				.enumerate()
-				.map(|(idx, p)| (idx + start_point, p))
-				.interleave(
-					left.iter_mut()
-						.rev()
-						.enumerate()
-						.map(|(idx, p)| (start_point - (idx + 1), p))
-				);
-
-			let area_w = area.width as f64 * col_w as f64;
-			let area_h = area.height as f64 * col_h as f64;
+			// This is our iterator over all the pages we want to look at and render. It uses this
+			// weird 'interleave' thing to render pages on *both sides* of the currently-displayed
+			// page in case they device to go forward or backwards.
+			let page_iter = PopOnNext {
+				inner: &mut need_rerender
+			}
+			.chain(InterleavedAroundWithMax::new(start_point, 0, n_pages).take(
+				match (&prerender, &search_term) {
+					// If the user has limited the amount of pages they want to prerender, then we
+					// just do what they ask. Nice and easy.
+					(PrerenderLimit::Limited(l), _) => l.get(),
+					// If they haven't limited it, but we don't have any search term that we're
+					// currently looking for, just go for all of it
+					(PrerenderLimit::All, None) => n_pages.get(),
+					// If they haven't limited it, and we DO have a search term we need to look
+					// for, just do 20 so that we don't dramatically slow down the search process
+					// since they've specifically initiated that and so we want it to take priority
+					(PrerenderLimit::All, Some(_)) =>
+						if any_not_searched {
+							20
+						} else {
+							n_pages.get()
+						},
+				}
+			));
 
 			// we go through each page
-			for (num, rendered) in page_iter {
+			for page_num in page_iter {
+				let rendered = &mut rendered[page_num];
+
 				// we only want to continue if one of the following is met:
 				// 1. It failed to render last time (we want to retry)
-				// 2. The `contained_term` is set to None (representing 'Unknown'), meaning that we
-				//    need to at least check if it contains the current term to see if it needs a
-				//    re-render
-				if rendered.successful && rendered.contained_term.is_some() {
+				// 2. The `contained_term` is set to Unknown, meaning that we need to at least
+				//    check if it contains the current term to see if it needs a re-render
+				if rendered.successful && rendered.num_search_found.is_some() {
 					continue;
+				}
+
+				// We know this is in range 'cause we're iterating over it but we still just want
+				// to be safe
+				let page = match doc.load_page(page_num as i32) {
+					Err(e) => {
+						sender.send(Err(RenderError::Doc(e)))?;
+						continue;
+					}
+					Ok(p) => p
+				};
+
+				// render the page
+				match render_single_page_to_ctx(
+					&page,
+					search_term.as_deref(),
+					rendered,
+					invert,
+					black,
+					white,
+					fit_or_fill,
+					rotate,
+					(area_w, area_h)
+				) {
+					// If that fn returned Some, that means it needed to be re-rendered for some
+					// reason or another, so we're sending it here
+					Ok(ctx) => {
+						let w = ctx.pixmap.width();
+						let h = ctx.pixmap.height();
+						let cap = (w * h * u32::from(ctx.pixmap.n())) as usize + 16;
+						let mut pixels = Vec::with_capacity(cap);
+						if let Err(e) = ctx.pixmap.write_to(&mut pixels, mupdf::ImageFormat::PNM) {
+							sender.send(Err(RenderError::Doc(e)))?;
+							continue;
+						}
+
+						log::debug!("got pixmap for page {page_num} with WxH {w}x{h}");
+
+						rendered.num_search_found = Some(ctx.result_rects.len());
+						rendered.successful = true;
+
+						sender.send(Ok(RenderInfo::Page(PageInfo {
+							img_data: ImageData {
+								pixels,
+								cell_w: (ctx.surface_w / f32::from(col_w)) as u16,
+								cell_h: (ctx.surface_h / f32::from(col_h)) as u16
+							},
+							page_num,
+							result_rects: ctx.result_rects
+						})))?;
+					}
+					// And if we got an error, then obviously we need to propagate that
+					Err(e) => sender.send(Err(RenderError::Doc(e)))?
 				}
 
 				// check if we've been told to change the area that we're rendering to,
@@ -225,253 +371,257 @@ pub fn start_rendering(
 					Err(TryRecvError::Disconnected) => return Ok(()),
 					Ok(notif) => handle_notif!(notif),
 					Err(TryRecvError::Empty) => ()
-				};
-
-				// We know this is in range 'cause we're iterating over it but we still just want
-				// to be safe
-				let Some(page) = doc.page(num as i32) else {
-					sender.send(Err(RenderError::Render(format!(
-						"Couldn't get page {num} ({}) of doc?",
-						num as i32
-					))))?;
-					continue;
-				};
-
-				let rendered_with_no_results =
-					rendered.successful && rendered.contained_term == Some(false);
-
-                serial_counter += 1;
-				// render the page
-                log_message_to_file(format!("Rendering page {} with zl {}, of {:?}, nr {}\n", num, zoom_level.lock().unwrap().clone(), offset.lock().unwrap().clone(), rendered_with_no_results));
-				match render_single_page_to_ctx(
-					page,
-					&search_term,
-					rendered_with_no_results,
-					(area_w, area_h),
-                    zoom_level.lock().unwrap().clone(),
-                    offset.lock().unwrap().clone(),
-                    multipage_mode,
-                    serial_counter
-				) {
-					// If we've already rendered it just fine and we don't need to render it again,
-					// just continue. We're all good
-					Ok(None) => (),
-					// If that fn returned Some, that means it needed to be re-rendered for some
-					// reason or another, so we're sending it here
-					Ok(Some(ctx)) => {
-						// we make a potentially incorrect assumption here that writing the context
-						// to a png won't fail, and mark that it all rendered correctly here before
-						// spawning off the thread to do so and send it.
-						rendered.contained_term = Some(ctx.num_results > 0);
-						rendered.successful = true;
-
-						// if this is the page that the user is currently trying to look at, don't
-						// bother spawning off a thread to render it to a png - it'll only slow
-						// down the time til the user can see it (due to the overhead of creating a
-						// thread), but we still want to spawn threads to render the other pages
-						// since the effects of parallelizing that will be noticeable if the user
-						// tries to move through pages more quickly
-						if num == start_point {
-							render_ctx_to_png(ctx, &mut sender, (col_w, col_h), num)?;
-						} else {
-							let mut sender = sender.clone();
-							thread::spawn(move || {
-								render_ctx_to_png(ctx, &mut sender, (col_w, col_h), num)
-							});
-						}
-                        // thread::sleep(std::time::Duration::from_millis(400));
-					}
-					// And if we got an error, then obviously we need to propagate that
-					Err(e) => sender.send(Err(RenderError::Render(e)))?
 				}
+			}
+
+			// Now, if we have a search term, we want to look through the rest of the document past
+			// what we've just rendered (and looked at the search results of)
+			if let Some(ref term) = search_term {
+				let mut search_start = start_point;
+				loop {
+					// hmm maybe this would be nice to make configurable but whatever
+					const SEARCH_AT_TIME: usize = 20;
+
+					// So now we want to look through all the remaining pages, starting after this
+					// current one (we don't do interleaving here 'cause I'm lazy
+					let page_idx = rendered[search_start..]
+						.iter_mut()
+						.enumerate()
+						// And we only want to take max SEARCH_AT_TIME of them since we don't want
+						// to block on this for *too* long
+						.take(SEARCH_AT_TIME)
+						// And we only want the ones that we still don't know about...
+						.filter(|(_, r)| r.num_search_found.is_none())
+						// And then adjust the index to be correct for the actual page number
+						.map(|(idx, r)| (idx + search_start, r));
+
+					// then we go through each...
+					for (page_num, rendered) in page_idx {
+						// We get the number of results (using the function that specifically just
+						// counts them instead of determining the quads of them all)
+						let num_results = doc
+							.load_page(page_num as i32)
+							.and_then(|page| count_search_results(&page, term))
+							.unwrap();
+
+						// And mark that whatever else was rendered last is not relevant anymore if
+						// there are results that need to be rendered
+						if num_results > 0 {
+							rendered.successful = false;
+						}
+						// Mark the `contained_term` field with this updated value...
+						rendered.num_search_found = Some(num_results);
+
+						// And send it over to the tui so that they can know and use it to
+						// determine what next page to jump to
+						sender.send(Ok(RenderInfo::SearchResults {
+							page_num,
+							num_results
+						}))?;
+					}
+
+					// then once we're done with this iteration, we increment search_start to
+					// prepare for the next iteration
+					search_start += SEARCH_AT_TIME;
+
+					// now, we want to check if we've gone past the end - if so, we go back to the
+					// beginning so we can get the pages before the current one.
+					if search_start > n_pages.get() {
+						if start_point == 0 {
+							break;
+						}
+
+						search_start = 0;
+					} else if ((search_start - SEARCH_AT_TIME) + 1..search_start)
+						.contains(&start_point)
+					{
+						// And if we are back at the place we started, we've looked through all the
+						// pages. Quit.
+						break;
+					}
+
+					match receiver.try_recv() {
+						// If there are no messages left for us, just continue in this loop
+						Err(TryRecvError::Empty) => (),
+						Err(TryRecvError::Disconnected) => return Ok(()),
+						Ok(msg) => handle_notif!(msg)
+					}
+				}
+			}
+
+			// So now we've just *searched* all the pages but not necessarily rendered all of them.
+			// So if there are any we have yet to render, we need to loop back to the beginning of
+			// this loop to continue rendering all of them
+			if rendered.iter().any(|r| !r.successful) && prerender == PrerenderLimit::All {
+				continue;
 			}
 
 			// Then once we've rendered all these pages, wait until we get another notification
 			// that this doc needs to be reloaded
-			loop {
-				// This once returned None despite the main thing being still connected (I think, at
-				// least), so I'm just being safe here
-				let Ok(msg) = receiver.recv() else {
-					return Ok(());
-				};
-				handle_notif!(msg);
-			}
+			// This once returned None despite the main thing being still connected (I think, at
+			// least), so I'm just being safe here
+			let Ok(msg) = receiver.recv() else {
+				return Ok(());
+			};
+
+			handle_notif!(msg);
 		}
 	}
 }
 
 struct RenderedContext {
-	surface: Surface,
-	num_results: usize,
-	surface_width: f64,
-	surface_height: f64,
-    index: usize,
+	pixmap: Pixmap,
+	surface_w: f32,
+	surface_h: f32,
+	result_rects: Vec<HighlightRect>
 }
 
-/// SAFETY: I think this is safe because, although the backing struct for `Surface` does contain
-/// pointers to like the cairo_backend_t struct that all the cairo stuff is using, that struct is
-/// basically just a vtable, so accessing it from multiple threads *should* be safe since we're
-/// just calling the same functions with different data. The only other thing it holds reference to
-/// is a `cairo_device_t`, but that seems to be thread-safe because it's managed through ref counts
-/// and a mutex. Also, as far as I can tell from reading the source code, write_to_png_stream (the
-/// only function we call on this struct) doesn't access the device at all, so we should be fine
-/// there.
-/// We want this to be Send so that we can delegate the png writing to a separate thread (since
-/// that's the thing that takes the most time, by far, in this app).
-unsafe impl Send for RenderedContext {}
-
+#[expect(clippy::too_many_arguments)]
 fn render_single_page_to_ctx(
-	page: Page,
-	search_term: &Option<String>,
-	already_rendered_no_results: bool,
-	(area_w, area_h): (f64, f64),
-    // (offset_x, offset_y): (f64, f64),
-    zoom_level: f64,
-    offset: (f64, f64),
-    multipage_mode: bool,
-    serial_counter: usize
-) -> Result<Option<RenderedContext>, String> {
-	let mut result_rects = search_term
-		.as_ref()
-		.map(|term| page.find_text_with_options(term, FindFlags::DEFAULT | FindFlags::MULTILINE))
-		.unwrap_or_default();
-
-    let (offset_x, offset_y): (f64, f64) = offset;
-    let zoom_factor = if multipage_mode { 1.0 } else { zoom_level };
-
-	// If there are no search terms on this page, and we've already rendered it with no search
-	// terms, then just return none to avoid this computation
-	if result_rects.is_empty() && already_rendered_no_results {
-        log_message_to_file(format!("Avoided\n"));
-		return Ok(None);
-	}
+	page: &Page,
+	search_term: Option<&str>,
+	prev_render: &PrevRender,
+	invert: bool,
+	black: i32,
+	white: i32,
+	fit_or_fill: FitOrFill,
+	rotate: RotateDirection,
+	(area_w, area_h): (f32, f32)
+) -> Result<RenderedContext, mupdf::error::Error> {
+	let result_rects = match prev_render.num_search_found {
+		None => search_page(page, search_term, 0)?,
+		Some(0) => Vec::new(),
+		Some(count @ 1..) => search_page(page, search_term, count)?
+	};
 
 	// then, get the size of the page
-	let (p_width, p_height) = page.size();
-
-	// and get its aspect ratio
-	let p_aspect_ratio = p_width / p_height;
-
-	// Then we get the full pixel dimensions of the area provided to us, and the aspect ratio
-	// of that area
-	let area_aspect_ratio = area_w / area_h;
-
-	// and get the ratio that this page would have to be scaled by to fit perfectly within the
-	// area provided to us.
-	// we do this first by comparing the aspec ratio of the page with the aspect ratio of the
-	// area to fit it within. If the aspect ratio of the page is larger, then we need to scale
-	// the width of the page to fill perfectly within the height of the area. Otherwise, we
-	// scale the height to fit perfectly. The dimension that _is not_ scaled to fit perfectly
-	// is scaled by the same factor as the dimension that _is_ scaled perfectly.
-	let scale_factor = if p_aspect_ratio > area_aspect_ratio {
-		area_w / p_width
-	} else {
-		area_h / p_height
+	let bounds = page.bounds()?;
+	let page_dim = match rotate {
+		RotateDirection::Deg0 | RotateDirection::Deg180 =>
+			(bounds.x1 - bounds.x0, bounds.y1 - bounds.y0),
+		RotateDirection::Deg90 | RotateDirection::Deg270 =>
+			(bounds.y1 - bounds.y0, bounds.x1 - bounds.x0),
 	};
 
-    let p_real_width = if multipage_mode {
-        p_width
-    } else {
-        p_width * zoom_factor
-    }.min(area_w / scale_factor);
-	let surface_width = p_real_width * scale_factor;
-	let surface_height = p_height * scale_factor;
+	let scaled = scale_img_for_area(page_dim, (area_w, area_h), fit_or_fill);
+	let ScaledResult {
+		width: mut surface_w,
+		height: mut surface_h,
+		mut scale_factor
+	} = scaled;
 
-	let surface = cairo::ImageSurface::create(
-		Format::Rgb16_565,
-		// No matter how big you make these arguments, the image will be drawn at the same
-		// size. So if you make them really big, the image will be drawn on a quarter of it. If
-		// you make them really small, the image will cover more than all of the surface.
-		//
-		// However, that only stands as long as you don't scale the context that you place this
-		// surface into. If you scale the dimensions of this image by n, then scale the context
-		// by that same amount, then it'll still fit perfectly into the context, but be
-		// rendered at higher quality.
-		surface_width as i32,
-		surface_height as i32
-	)
-	.map_err(|e| format!("Couldn't create ImageSurface: {e}"))?;
-	surface.set_device_scale(scale_factor * zoom_factor, scale_factor * zoom_factor);
-
-	let ctx = Context::new(surface).map_err(|e| format!("Couldn't create Context: {e}"))?;
-
-	// The default background color of PDFs (at least, I think) is white, so we need to set
-	// that as the background color, then paint, then render.
-	ctx.set_source_rgba(0.2, 0.2, 0.2, 1.0);
-	ctx.set_antialias(Antialias::None);
-	ctx.paint()
-		.map_err(|e| format!("Couldn't paint Context: {e}"))?;
-
-    ctx.translate(-offset_x, -offset_y);
-	ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-    ctx.rectangle(0.0, 0.0, p_width, p_height);
-    ctx.fill().map_err(|e| format!("Couldn't fill Context: {e}"))?;
-    ctx.rectangle(offset_x, offset_y, p_real_width / zoom_factor, p_height / zoom_factor);
-    ctx.clip();
-
-	page.render(&ctx);
-
-	let num_results = result_rects.len();
-
-	if !result_rects.is_empty() {
-		let mut highlight_color = Color::new();
-		highlight_color.set_red((u16::MAX / 5) * 4);
-		highlight_color.set_green((u16::MAX / 5) * 4);
-
-		let mut old_rect = Rectangle::new();
-		for rect in result_rects.iter_mut() {
-			// According to https://gitlab.freedesktop.org/poppler/poppler/-/issues/763, these rects
-			// need to be corrected since they use different references as the y-coordinate base
-			rect.set_y1(p_height - rect.y1());
-			rect.set_y2(p_height - rect.y2());
-
-			page.render_selection(
-				&ctx,
-				rect,
-				&mut old_rect,
-				SelectionStyle::Glyph,
-				&mut Color::new(),
-				&mut highlight_color
-			);
-		}
+	if surface_w > KITTY_MAX_W_OR_H || surface_h > KITTY_MAX_W_OR_H {
+		let descale = (surface_w / KITTY_MAX_W_OR_H).max(surface_h / KITTY_MAX_W_OR_H);
+		surface_w /= descale;
+		surface_h /= descale;
+		scale_factor /= descale;
 	}
 
-    log_message_to_file(format!("Rendered page with counter = {}\n", serial_counter));
-	let rc = RenderedContext {
-		surface: ctx.target(),
-		num_results,
-		surface_width,
-		surface_height,
-        index: serial_counter
+	let colorspace = Colorspace::device_rgb();
+	let mut matrix = Matrix::new_scale(scale_factor, scale_factor);
+	match rotate {
+		RotateDirection::Deg0 => matrix.rotate(0.0),
+		RotateDirection::Deg90 => matrix.rotate(90.0),
+		RotateDirection::Deg180 => matrix.rotate(180.0),
+		RotateDirection::Deg270 => matrix.rotate(270.0)
 	};
-    Ok(Some(rc))
+
+	let mut pixmap = page.to_pixmap(&matrix, &colorspace, false, false)?;
+	if invert {
+		pixmap.tint(white, black)?;
+	} else if black != MUPDF_BLACK || white != MUPDF_WHITE {
+		pixmap.tint(black, white)?;
+	}
+
+	let (x_res, y_res) = pixmap.resolution();
+	let new_x = (x_res as f32 * scale_factor) as i32;
+	let new_y = (y_res as f32 * scale_factor) as i32;
+
+	pixmap.set_resolution(new_x, new_y);
+
+	let result_rects = result_rects
+		.into_iter()
+		.map(|quad| {
+			let ul_x = (quad.ul.x * scale_factor) as u32;
+			let ul_y = (quad.ul.y * scale_factor) as u32;
+			let lr_x = (quad.lr.x * scale_factor) as u32;
+			let lr_y = (quad.lr.y * scale_factor) as u32;
+			HighlightRect {
+				ul_x,
+				ul_y,
+				lr_x,
+				lr_y
+			}
+		})
+		.collect::<Vec<_>>();
+
+	Ok(RenderedContext {
+		pixmap,
+		surface_w,
+		surface_h,
+		result_rects
+	})
 }
 
-fn render_ctx_to_png(
-	ctx: RenderedContext,
-	sender: &mut Sender<Result<RenderInfo, RenderError>>,
-	(col_w, col_h): (u16, u16),
-	page: usize
-) -> Result<(), SendError<Result<RenderInfo, RenderError>>> {
-	let mut img_data = Vec::with_capacity((ctx.surface_height * ctx.surface_width) as usize);
+#[derive(Clone, Debug)]
+pub struct HighlightRect {
+	pub ul_x: u32,
+	pub ul_y: u32,
+	pub lr_x: u32,
+	pub lr_y: u32
+}
 
-    log_message_to_file(format!("Writing to png with counter = {}\n", ctx.index));
-	match ctx.surface.write_to_png(&mut img_data) {
-		Err(e) => sender.send(Err(RenderError::Render(format!(
-			"Couldn't write surface to png: {e}"
-		)))),
-		Ok(()) => sender.send(Ok(RenderInfo::Page(PageInfo {
-			img_data: ImageData {
-				data: img_data,
-				area: Rect {
-					width: ctx.surface_width as u16 / col_w,
-					height: ctx.surface_height as u16 / col_h,
-					x: 0,
-					y: 0
-				}
-			},
-			page,
-			search_results: ctx.num_results
-		})))
+#[inline]
+fn search_page(
+	page: &Page,
+	search_term: Option<&str>,
+	trusted_search_results: usize
+) -> Result<Vec<Quad>, mupdf::error::Error> {
+	search_term
+		.map(|term| {
+			page.to_text_page(TextPageFlags::empty()).and_then(|page| {
+				let mut v = Vec::with_capacity(trusted_search_results);
+				page.search_cb(term, &mut v, |v, results| {
+					v.extend(results.iter().cloned());
+					SearchHitResponse::ContinueSearch
+				})
+				.map(|_| v)
+			})
+		})
+		.transpose()
+		.map(Option::unwrap_or_default)
+}
+
+#[inline]
+fn count_search_results(page: &Page, search_term: &str) -> Result<usize, mupdf::error::Error> {
+	page.to_text_page(TextPageFlags::empty()).and_then(|page| {
+		let mut count = 0;
+		page.search_cb(search_term, &mut count, |count, results| {
+			*count += results.len();
+			SearchHitResponse::ContinueSearch
+		})?;
+		Ok(count)
+	})
+}
+
+struct PopOnNext<'a> {
+	inner: &'a mut VecDeque<usize>
+}
+
+impl Iterator for PopOnNext<'_> {
+	type Item = usize;
+	fn next(&mut self) -> Option<Self::Item> {
+		self.inner.pop_front()
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		let l = self.len();
+		(l, Some(l))
+	}
+}
+
+impl ExactSizeIterator for PopOnNext<'_> {
+	fn len(&self) -> usize {
+		self.inner.len()
 	}
 }
