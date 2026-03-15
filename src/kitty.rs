@@ -1,5 +1,6 @@
 use std::{io::Write, num::NonZeroU32};
 
+
 use crossterm::{
 	cursor::MoveTo,
 	event::EventStream,
@@ -64,7 +65,7 @@ pub struct KittyReadyToDisplay<'tui> {
 	pub pos: Position,
 	pub display_loc: DisplayLocation,
 	pub cell_w: u16,
-	pub cell_h: u16
+	pub cell_h: u16,
 }
 
 pub enum KittyDisplay<'tui> {
@@ -223,8 +224,8 @@ async fn run_action_at<'es>(
 }
 
 /// Write unicode placeholder characters for a Kitty image to stdout (tmux's virtual terminal).
-/// The image ID is encoded in the 24-bit foreground color; row/column indices are encoded as
-/// combining diacritical marks after U+10EEEE.
+/// The image ID is encoded in the 24-bit foreground color; row/column indices are 1:1 with
+/// display cells.
 fn write_unicode_placeholders(
 	stdout: &mut impl Write,
 	image_id: u32,
@@ -238,13 +239,11 @@ fn write_unicode_placeholders(
 
 	let mut buf = String::new();
 	for row in 0..cell_h {
-		// Move to start of row (1-based)
 		buf.push_str(&format!(
 			"\x1b[{};{}H",
 			pos.y as u32 + row as u32 + 1,
 			pos.x as u32 + 1
 		));
-		// Set 24-bit foreground color to encode image ID
 		buf.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
 		let row_diac = DIACRITICS[row as usize % 256];
 		for col in 0..cell_w {
@@ -254,7 +253,6 @@ fn write_unicode_placeholders(
 			buf.push(col_diac);
 		}
 	}
-	// Reset colors
 	buf.push_str("\x1b[0m");
 	stdout.write_all(buf.as_bytes())?;
 	stdout.flush()
@@ -301,20 +299,25 @@ pub async fn display_kitty_images<'es>(
 
 	if tmux_offset.is_some() {
 		// ---- TMUX UNICODE PLACEHOLDER PATH ----
-		// 1. Transmit new images via DCS passthrough with U=1
-		// 2. Write unicode placeholder chars to tmux's virtual terminal
+		// Diacritics are always 1:1 with display cells; zoom is not supported in tmux.
 		let mut err = None;
 		for KittyReadyToDisplay {
 			img,
 			page_num,
 			pos,
-			display_loc: _,
 			cell_w,
-			cell_h
+			cell_h,
+			..
 		} in images
 		{
 			let image_id = match img {
 				MaybeTransferred::NotYet(image) => {
+					let config = DisplayConfig {
+						create_virtual_placement: true,
+						location: DisplayLocation::default(),
+						cursor_movement: CursorMovementPolicy::DontMove,
+						..DisplayConfig::default()
+					};
 					let mut fake_image = Image {
 						num_or_id: image.num_or_id,
 						format: PixelFormat::Rgb24(
@@ -331,17 +334,16 @@ pub async fn display_kitty_images<'es>(
 					};
 					std::mem::swap(image, &mut fake_image);
 
-					let config = DisplayConfig {
-						create_virtual_placement: true,
-						cursor_movement: CursorMovementPolicy::DontMove,
-						..DisplayConfig::default()
+					let pid = match fake_image.num_or_id {
+						NumberOrId::Id(id) => id,
+						NumberOrId::Number(n) => n
 					};
 
 					let res = run_action(
 						Action::TransmitAndDisplay {
 							image: fake_image,
 							config,
-							placement_id: None
+							placement_id: Some(pid)
 						},
 						ev_stream,
 						tmux_offset
@@ -363,7 +365,6 @@ pub async fn display_kitty_images<'es>(
 				MaybeTransferred::Transferred(image_id) => *image_id
 			};
 
-			// Write unicode placeholders to tmux's virtual terminal (NOT through passthrough)
 			write_unicode_placeholders(
 				&mut std::io::stdout().lock(),
 				image_id.get(),
@@ -382,15 +383,14 @@ pub async fn display_kitty_images<'es>(
 		};
 	}
 
-	// ---- NON-TMUX KITTY PATH (unchanged) ----
+	// ---- NON-TMUX KITTY PATH ----
 	let mut err = None;
 	for KittyReadyToDisplay {
 		img,
 		page_num,
 		pos,
 		display_loc,
-		cell_w: _,
-		cell_h: _
+		..
 	} in images
 	{
 		let config = DisplayConfig {
@@ -398,9 +398,6 @@ pub async fn display_kitty_images<'es>(
 			cursor_movement: CursorMovementPolicy::DontMove,
 			..DisplayConfig::default()
 		};
-
-		log::debug!("going to display img {img:#?}");
-		log::debug!("displaying with config {config:#?}");
 
 		let this_err = match img {
 			MaybeTransferred::NotYet(image) => {
@@ -454,8 +451,6 @@ pub async fn display_kitty_images<'es>(
 			.map(|_| ())
 			.map_err(|e| (page_num, e))
 		};
-
-		log::debug!("this_err is {this_err:#?}");
 
 		if let Err((id, e)) = this_err {
 			let e = err.get_or_insert_with(|| (vec![], e));

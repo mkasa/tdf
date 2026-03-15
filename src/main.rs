@@ -315,7 +315,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		|n| n.to_string_lossy().to_string()
 	);
 	let initial_page = flags.page.unwrap_or(1).saturating_sub(1);
-	let mut tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty);
+	let mut tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty, tmux_offset.is_some());
 	if initial_page > 0 {
 		tui.page = initial_page;
 	}
@@ -494,26 +494,21 @@ async fn enter_redraw_loop(
 				to_display = tui.render(f, &main_area, font_size);
 			})?;
 
-			let maybe_err = display_kitty_images(to_display, &mut ev_stream, tmux_offset).await;
-
-			if let Err((to_replace, err_desc, enum_err)) = maybe_err {
+			if let Err((to_replace, err_desc, enum_err)) =
+				display_kitty_images(to_display, &mut ev_stream, tmux_offset).await
+			{
 				match enum_err {
-					// This is the error that kitty & ghostty provide us when they delete an
-					// image due to memory constraints, so if we get it, we just fix it by
-					// re-rendering so it don't display it to the user
-					//
-					// [TODO] maybe when we detect that an image was deleted, we probe the
-					// terminal for the pages around it to see if they were deleted too and if
-					// they were, we re-render them? idk
+					// This is the error that kitty & ghostty provide us when they delete
+					// an image due to memory constraints, so if we get it, we just fix
+					// it by re-rendering so it don't display it to the user
 					TransmitError::Terminal(TerminalError::NoEntity(_)) => (),
-					_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
-						"{err_desc}: {enum_err}"
-					))))
+					_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(
+						format!("{err_desc}: {enum_err}")
+					)))
 				}
 
 				for page_num in to_replace {
 					tui.page_failed_display(page_num);
-					// So that they get re-rendered and sent over again
 					to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
 				}
 			}

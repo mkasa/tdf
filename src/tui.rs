@@ -40,6 +40,7 @@ pub struct Tui {
 	page_constraints: PageConstraints,
 	showing_help_msg: bool,
 	is_kitty: bool,
+	tmux_placeholders: bool,
 	zoom: Option<Zoom>
 }
 
@@ -185,7 +186,13 @@ pub struct RenderLayout {
 
 impl Tui {
 	#[must_use]
-	pub fn new(name: String, max_wide: Option<NonZeroUsize>, r_to_l: bool, is_kitty: bool) -> Self {
+	pub fn new(
+		name: String,
+		max_wide: Option<NonZeroUsize>,
+		r_to_l: bool,
+		is_kitty: bool,
+		tmux_placeholders: bool
+	) -> Self {
 		Self {
 			name,
 			page: 0,
@@ -196,6 +203,7 @@ impl Tui {
 			page_constraints: PageConstraints { max_wide, r_to_l },
 			showing_help_msg: false,
 			is_kitty,
+			tmux_placeholders,
 			zoom: None
 		}
 	}
@@ -346,7 +354,7 @@ impl Tui {
 				..DisplayLocation::default()
 			},
 			cell_w: img_area.width,
-			cell_h: img_area.height
+			cell_h: img_area.height,
 		}])
 	}
 
@@ -488,7 +496,7 @@ impl Tui {
 						pos,
 						display_loc: DisplayLocation::default(),
 						cell_w: cw,
-						cell_h: ch
+						cell_h: ch,
 					})
 				})
 				.collect::<Vec<_>>();
@@ -700,7 +708,7 @@ impl Tui {
 			InputAction::JumpingToPage(new_page)
 		}
 
-		let can_zoom = self.is_kitty && self.zoom.is_some();
+		let can_zoom = self.is_kitty && !self.tmux_placeholders && self.zoom.is_some();
 
 		match ev {
 			Event::Key(key) => {
@@ -825,7 +833,7 @@ impl Tui {
 								self.last_render.rect = Rect::default();
 								Some(InputAction::Redraw)
 							}
-							'z' if self.is_kitty => {
+							'z' if self.is_kitty && !self.tmux_placeholders => {
 								let (zoom, f_or_f) = match self.zoom {
 									None => (Some(Zoom::default()), FitOrFill::Fill),
 									Some(_) => (None, FitOrFill::Fit)
