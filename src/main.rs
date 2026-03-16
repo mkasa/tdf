@@ -477,22 +477,33 @@ async fn enter_redraw_loop(
 
 				match tui.handle_event(&ev) {
 					None => needs_redraw = false,
-					Some(action) => match action {
-						InputAction::Redraw => (),
-						InputAction::QuitApp => return Ok(()),
-						InputAction::JumpingToPage(page) => {
-							to_renderer.send(RenderNotif::JumpToPage(page))?;
-							to_converter.send(ConverterMsg::GoToPage(page))?;
-						},
-						InputAction::Search(term) => to_renderer.send(RenderNotif::Search(term))?,
-						InputAction::Invert => to_renderer.send(RenderNotif::Invert)?,
-						InputAction::Rotate => to_renderer.send(RenderNotif::Rotate)?,
-						InputAction::Fullscreen => fullscreen = !fullscreen,
-						InputAction::SwitchRenderZoom(f_or_f) => {
-							to_renderer.send(RenderNotif::SwitchFitOrFill(f_or_f)).unwrap();
+						Some(action) => match action {
+							InputAction::Redraw => (),
+							InputAction::QuitApp => return Ok(()),
+							InputAction::JumpingToPage(page) => {
+								to_renderer.send(RenderNotif::JumpToPage(page))?;
+								to_converter.send(ConverterMsg::GoToPage(page))?;
+							},
+							InputAction::Search(term) => to_renderer.send(RenderNotif::Search(term))?,
+							InputAction::Invert => {
+								tui.advance_render_generation();
+								to_renderer.send(RenderNotif::Invert)?;
+							}
+							InputAction::Rotate => {
+								tui.advance_render_generation();
+								to_renderer.send(RenderNotif::Rotate)?;
+							}
+							InputAction::Fullscreen => fullscreen = !fullscreen,
+							InputAction::SwitchRenderZoom(f_or_f) => {
+								tui.advance_render_generation();
+								to_renderer.send(RenderNotif::SwitchFitOrFill(f_or_f)).unwrap();
+							}
+							InputAction::SetRenderScale(scale) => {
+								tui.advance_render_generation();
+								to_renderer.send(RenderNotif::SetRenderScale(scale))?;
+							}
 						}
 					}
-				}
 
 				if ev.is_focus_lost() {
 					app_focused = false;
@@ -542,11 +553,12 @@ async fn enter_redraw_loop(
 		};
 
 		let new_area = Tui::main_layout(&term.get_frame(), fullscreen);
-		if new_area != main_area {
-			main_area = new_area;
-			to_renderer.send(RenderNotif::Area(main_area.page_area))?;
-			needs_redraw = true;
-		}
+			if new_area != main_area {
+				main_area = new_area;
+				tui.advance_render_generation();
+				to_renderer.send(RenderNotif::Area(main_area.page_area))?;
+				needs_redraw = true;
+			}
 
 		if needs_redraw {
 			let mut to_display = KittyDisplay::NoChange;

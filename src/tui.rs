@@ -983,16 +983,22 @@ impl Tui {
 								self.last_render.rect = Rect::default();
 								Some(InputAction::Redraw)
 							}
-							'z' => {
-								self.zoom = match self.zoom {
-									None => Some(Zoom::default()),
-									Some(_) => None
-								};
-								self.last_render.rect = Rect::default();
-								Some(InputAction::Redraw)
-							}
-							'o' if can_zoom => self.update_zoom(Zoom::step_in),
-							'O' if can_zoom => self.update_zoom(Zoom::step_out),
+								'z' => {
+									let old_scale = self.current_render_scale();
+									self.zoom = match self.zoom {
+										None => Some(Zoom::default()),
+										Some(_) => None
+									};
+									self.last_render.rect = Rect::default();
+									let new_scale = self.current_render_scale();
+									if (new_scale - old_scale).abs() > f32::EPSILON {
+										Some(InputAction::SetRenderScale(new_scale))
+									} else {
+										Some(InputAction::Redraw)
+									}
+								}
+								'o' if can_zoom => self.update_zoom_level(Zoom::step_in),
+								'O' if can_zoom => self.update_zoom_level(Zoom::step_out),
 							'L' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
 							'H' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
 							'J' if can_zoom => self.update_zoom(|z| z.pan(Direction::Down)),
@@ -1132,6 +1138,31 @@ impl Tui {
 		}
 		self.last_render.rect = Rect::default();
 		Some(InputAction::Redraw)
+	}
+
+	fn update_zoom_level(&mut self, f: impl FnOnce(&mut Zoom)) -> Option<InputAction> {
+		let old_scale = self.current_render_scale();
+		if let Some(z) = &mut self.zoom {
+			f(z);
+		}
+		self.last_render.rect = Rect::default();
+		let new_scale = self.current_render_scale();
+		if (new_scale - old_scale).abs() > f32::EPSILON {
+			Some(InputAction::SetRenderScale(new_scale))
+		} else {
+			Some(InputAction::Redraw)
+		}
+	}
+
+	fn current_render_scale(&self) -> f32 {
+		self.zoom
+			.as_ref()
+			.filter(|zoom| zoom.level > 0)
+			.map_or(1.0, Zoom::factor)
+	}
+
+	pub fn advance_render_generation(&mut self) {
+		self.render_generation = self.render_generation.saturating_add(1);
 	}
 
 	pub fn show_error(&mut self, err: RenderError) {
@@ -1284,7 +1315,8 @@ pub enum InputAction {
 	Invert,
 	Rotate,
 	Fullscreen,
-	SwitchRenderZoom(crate::FitOrFill)
+	SwitchRenderZoom(crate::FitOrFill),
+	SetRenderScale(f32)
 }
 
 #[derive(Copy, Clone)]

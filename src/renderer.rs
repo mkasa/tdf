@@ -19,6 +19,7 @@ pub enum RenderNotif {
 	PageNeedsReRender(usize),
 	Search(String),
 	SwitchFitOrFill(FitOrFill),
+	SetRenderScale(f32),
 	Reload,
 	Invert,
 	Rotate
@@ -113,6 +114,7 @@ pub fn start_rendering(
 	let mut rotate = RotateDirection::Deg0;
 	let mut preserved_area = None;
 	let mut fit_or_fill = FitOrFill::Fit;
+	let mut render_scale = 1.0_f32;
 	let mut generation = 0_u64;
 
 	let mut need_rerender = VecDeque::new();
@@ -229,6 +231,13 @@ pub fn start_rendering(
 								fill_default(&mut rendered, n_pages.get());
 								continue 'render_pages;
 							},
+						RenderNotif::SetRenderScale(scale) =>
+							if (scale - render_scale).abs() > f32::EPSILON {
+								render_scale = scale;
+								generation = generation.saturating_add(1);
+								fill_default(&mut rendered, n_pages.get());
+								continue 'render_pages;
+							},
 						RenderNotif::JumpToPage(page) => {
 							start_point = page;
 							continue 'render_pages;
@@ -330,17 +339,18 @@ pub fn start_rendering(
 				};
 
 				// render the page
-				match render_single_page_to_ctx(
-					&page,
-					search_term.as_deref(),
-					rendered,
-					invert,
-					black,
-					white,
-					fit_or_fill,
-					rotate,
-					(area_w, area_h)
-				) {
+					match render_single_page_to_ctx(
+						&page,
+						search_term.as_deref(),
+						rendered,
+						invert,
+						black,
+						white,
+						fit_or_fill,
+						render_scale,
+						rotate,
+						(area_w, area_h)
+					) {
 					// If that fn returned Some, that means it needed to be re-rendered for some
 					// reason or another, so we're sending it here
 					Ok(ctx) => {
@@ -496,6 +506,7 @@ fn render_single_page_to_ctx(
 	black: i32,
 	white: i32,
 	fit_or_fill: FitOrFill,
+	render_scale: f32,
 	rotate: RotateDirection,
 	(area_w, area_h): (f32, f32)
 ) -> Result<RenderedContext, mupdf::error::Error> {
@@ -516,20 +527,21 @@ fn render_single_page_to_ctx(
 
 	let scaled = scale_img_for_area(page_dim, (area_w, area_h), fit_or_fill);
 	let ScaledResult {
-		width: mut surface_w,
-		height: mut surface_h,
-		mut scale_factor
+		width: surface_w,
+		height: surface_h,
+		scale_factor
 	} = scaled;
+	let mut actual_scale_factor = scale_factor * render_scale.max(1.0);
+	let render_w = surface_w * render_scale.max(1.0);
+	let render_h = surface_h * render_scale.max(1.0);
 
-	if surface_w > KITTY_MAX_W_OR_H || surface_h > KITTY_MAX_W_OR_H {
-		let descale = (surface_w / KITTY_MAX_W_OR_H).max(surface_h / KITTY_MAX_W_OR_H);
-		surface_w /= descale;
-		surface_h /= descale;
-		scale_factor /= descale;
+	if render_w > KITTY_MAX_W_OR_H || render_h > KITTY_MAX_W_OR_H {
+		let descale = (render_w / KITTY_MAX_W_OR_H).max(render_h / KITTY_MAX_W_OR_H);
+		actual_scale_factor /= descale;
 	}
 
 	let colorspace = Colorspace::device_rgb();
-	let mut matrix = Matrix::new_scale(scale_factor, scale_factor);
+	let mut matrix = Matrix::new_scale(actual_scale_factor, actual_scale_factor);
 	match rotate {
 		RotateDirection::Deg0 => matrix.rotate(0.0),
 		RotateDirection::Deg90 => matrix.rotate(90.0),
@@ -545,18 +557,18 @@ fn render_single_page_to_ctx(
 	}
 
 	let (x_res, y_res) = pixmap.resolution();
-	let new_x = (x_res as f32 * scale_factor) as i32;
-	let new_y = (y_res as f32 * scale_factor) as i32;
+	let new_x = (x_res as f32 * actual_scale_factor) as i32;
+	let new_y = (y_res as f32 * actual_scale_factor) as i32;
 
 	pixmap.set_resolution(new_x, new_y);
 
 	let result_rects = result_rects
 		.into_iter()
 		.map(|quad| {
-			let ul_x = (quad.ul.x * scale_factor) as u32;
-			let ul_y = (quad.ul.y * scale_factor) as u32;
-			let lr_x = (quad.lr.x * scale_factor) as u32;
-			let lr_y = (quad.lr.y * scale_factor) as u32;
+			let ul_x = (quad.ul.x * actual_scale_factor) as u32;
+			let ul_y = (quad.ul.y * actual_scale_factor) as u32;
+			let lr_x = (quad.lr.x * actual_scale_factor) as u32;
+			let lr_y = (quad.lr.y * actual_scale_factor) as u32;
 			HighlightRect {
 				ul_x,
 				ul_y,
