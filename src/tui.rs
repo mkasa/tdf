@@ -23,7 +23,7 @@ use ratatui_image::{FontSize, Image, protocol::{Protocol, iterm2::Iterm2}};
 
 use crate::{
 	converter::{ConvertedImage, MaybeTransferred},
-	kitty::{KittyDisplay, KittyReadyToDisplay},
+	kitty::{KittyDisplay, KittyImage, KittyReadyToDisplay},
 	renderer::{RenderError, fill_default},
 	skip::Skip
 };
@@ -40,6 +40,7 @@ pub struct Tui {
 	page_constraints: PageConstraints,
 	showing_help_msg: bool,
 	is_kitty: bool,
+	tmux_placeholders: bool,
 	render_generation: u64,
 	zoom: Option<Zoom>
 }
@@ -190,7 +191,8 @@ impl Tui {
 		name: String,
 		max_wide: Option<NonZeroUsize>,
 		r_to_l: bool,
-		is_kitty: bool
+		is_kitty: bool,
+		tmux_placeholders: bool
 	) -> Self {
 		Self {
 			name,
@@ -202,6 +204,7 @@ impl Tui {
 			page_constraints: PageConstraints { max_wide, r_to_l },
 			showing_help_msg: false,
 			is_kitty,
+			tmux_placeholders,
 			render_generation: 0,
 			zoom: None
 		}
@@ -236,8 +239,10 @@ impl Tui {
 		// area of the 'fit-screen' page
 		mut img_area: Rect,
 		font_size: FontSize,
+		tmux_placeholders: bool,
 		zoom: &mut Zoom,
 		img: &'s mut MaybeTransferred,
+		source: &DynamicImage,
 		page_num: usize,
 		img_px_w: u32,
 		img_px_h: u32,
@@ -281,7 +286,7 @@ impl Tui {
 					&mut img_area.width,
 					&mut img_area.x,
 					// disallow zooming out past fit-screen
-					zoom_factor.max(1.0 / img_page_h_ratio)
+					zoom_factor.max(img_page_h_ratio)
 				);
 			} else {
 				// horizontal scroll / wide image. zooming out means decreasing the width of the page area
@@ -289,7 +294,7 @@ impl Tui {
 					&mut img_area.height,
 					&mut img_area.y,
 					// disallow zooming out past fit-screen
-					zoom_factor.max(1.0 / img_page_w_ratio)
+					zoom_factor.max(img_page_w_ratio)
 				);
 			}
 		}
@@ -320,8 +325,37 @@ impl Tui {
 
 		log::debug!("after adjustment, page area is {img_area:#?}");
 
+		if tmux_placeholders {
+			let crop_x = (f32::from(zoom.cell_pan_from_left) * px_per_cell_w).round() as u32;
+			let crop_y = (f32::from(zoom.cell_pan_from_top) * px_per_cell_h).round() as u32;
+			let crop_w = crop_w.round() as u32;
+			let crop_h = crop_h.round() as u32;
+			let cropped = source.crop_imm(crop_x, crop_y, crop_w, crop_h);
+			let resized = cropped.resize_exact(
+				target_px_w.max(1.0).round() as u32,
+				target_px_h.max(1.0).round() as u32,
+				image::imageops::FilterType::Triangle
+			);
+
+			return KittyDisplay::DisplayImages(vec![KittyReadyToDisplay {
+				img: KittyImage::Dynamic(resized),
+				page_num,
+				pos: Position {
+					x: img_area.x,
+					y: img_area.y
+				},
+				display_loc: DisplayLocation {
+					columns: img_area.width,
+					rows: img_area.height,
+					..DisplayLocation::default()
+				},
+				cell_w: img_area.width,
+				cell_h: img_area.height,
+			}]);
+		}
+
 		KittyDisplay::DisplayImages(vec![KittyReadyToDisplay {
-			img,
+			img: KittyImage::Cached(img),
 			page_num,
 			pos: Position {
 				x: img_area.x,
@@ -375,13 +409,13 @@ impl Tui {
 				shrink_move_page(
 					&mut img_area.width,
 					&mut img_area.x,
-					zoom_factor.max(1.0 / img_page_h_ratio)
+					zoom_factor.max(img_page_h_ratio)
 				);
 			} else {
 				shrink_move_page(
 					&mut img_area.height,
 					&mut img_area.y,
-					zoom_factor.max(1.0 / img_page_w_ratio)
+					zoom_factor.max(img_page_w_ratio)
 				);
 			}
 		}
@@ -481,6 +515,7 @@ impl Tui {
 			{
 				let Some(ConvertedImage::Kitty {
 					ref mut img,
+					ref source,
 					px_w,
 					px_h,
 					cell_w,
@@ -496,7 +531,17 @@ impl Tui {
 					unused_width: 0
 				};
 				return Self::render_zoomed(
-					img_area, font_size, zoom, img, self.page, px_w, px_h, cell_w, cell_h
+					img_area,
+					font_size,
+					self.tmux_placeholders,
+					zoom,
+					img,
+					source,
+					self.page,
+					px_w,
+					px_h,
+					cell_w,
+					cell_h
 				);
 			}
 			if let Some(ConvertedImage::Generic {
@@ -580,7 +625,7 @@ impl Tui {
 						Self::render_single_page(frame, img, Rect { width, ..img_area });
 					img_area.x += width;
 					maybe_img.map(|(img, pos, cw, ch)| KittyReadyToDisplay {
-						img,
+						img: KittyImage::Cached(img),
 						page_num: idx + self.page,
 						pos,
 						display_loc: DisplayLocation::default(),
@@ -613,6 +658,7 @@ impl Tui {
 			}
 			ConvertedImage::Kitty {
 				img,
+				source: _,
 				px_w: _,
 				px_h: _,
 				cell_h,

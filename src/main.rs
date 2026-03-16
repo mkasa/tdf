@@ -356,7 +356,13 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		|n| n.to_string_lossy().to_string()
 	);
 	let initial_page = flags.page.unwrap_or(1).saturating_sub(1);
-	let mut tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty);
+	let mut tui = Tui::new(
+		file_name,
+		flags.max_wide,
+		flags.r_to_l,
+		is_kitty,
+		tmux_offset.is_some()
+	);
 	if initial_page > 0 {
 		tui.page = initial_page;
 	}

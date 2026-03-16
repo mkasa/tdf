@@ -34,6 +34,7 @@ pub enum ConvertedImage {
 	},
 	Kitty {
 		img: MaybeTransferred,
+		source: DynamicImage,
 		px_w: u32,
 		px_h: u32,
 		cell_w: u16,
@@ -54,6 +55,7 @@ impl ConvertedImage {
 			}
 			Self::Kitty {
 				img: _,
+				source: _,
 				px_w: _,
 				px_h: _,
 				cell_w,
@@ -149,6 +151,7 @@ pub async fn run_conversion_loop(
 
 		let txt_img = match picker.protocol_type() {
 			ProtocolType::Kitty => {
+				let source = dyn_img.clone();
 				let rn = SystemTime::now()
 					.duration_since(UNIX_EPOCH)
 					.unwrap_or_default()
@@ -172,6 +175,7 @@ pub async fn run_conversion_loop(
 
 				ConvertedImage::Kitty {
 					img: MaybeTransferred::NotYet(img),
+					source,
 					px_w: page_info.img_data.px_w,
 					px_h: page_info.img_data.px_h,
 					cell_w: page_info.img_data.cell_w,
