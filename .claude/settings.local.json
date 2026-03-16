@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout:*)",
+      "Bash(cargo check:*)",
+      "Bash(rustc:*)",
+      "Bash(cargo update:*)",
+      "Bash(cargo search:*)",
+      "Bash(mise ls:*)",
+      "Bash(mise install:*)",
+      "Bash(mise use:*)",
+      "Bash(git add:*)",
+      "Bash(git submodule:*)",
+      "Bash(find:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo build:*)",
+      "Bash(git commit:*)",
+      "Bash(git config:*)",
+      "Bash(grep:*)",
+      "Bash(cargo doc:*)",
+      "WebFetch(domain:sw.kovidgoyal.net)",
+      "WebFetch(domain:crates.io)",
+      "Bash(gh api:*)"
+    ]
+  }
+}
