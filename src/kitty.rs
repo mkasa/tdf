@@ -437,7 +437,7 @@ pub async fn display_kitty_images<'es>(
 					}
 					let image = Image {
 						num_or_id: NumberOrId::Id(
-							kittage::action::NONZERO_ONE.saturating_add(page_num as u32)
+							crate::image_id_base().saturating_add(page_num as u32)
 						),
 						format: PixelFormat::Png(None),
 						medium: Medium::Direct {
