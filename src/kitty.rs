@@ -1,4 +1,8 @@
-use std::{io::{Cursor, Write}, num::NonZeroU32};
+use std::{
+	io::{Cursor, Write},
+	num::NonZeroU32,
+	time::{SystemTime, UNIX_EPOCH}
+};
 
 
 use crossterm::{
@@ -197,6 +201,10 @@ fn write_action_without_response(
 pub async fn do_shms_work(ev_stream: &mut EventStream, tmux_offset: Option<(u16, u16)>) -> bool {
 	let img = DynamicImage::new_rgb8(1, 1);
 	let pid = std::process::id();
+
+	#[cfg(unix)]
+	let shm_name = format!("/tdf_test_{pid}");
+	#[cfg(windows)]
 	let shm_name = format!("tdf_test_{pid}");
 
 	#[cfg(unix)]
@@ -306,7 +314,8 @@ fn tmux_display_config(display_loc: DisplayLocation, cell_w: u16, cell_h: u16) -
 pub async fn display_kitty_images<'es>(
 	display: KittyDisplay<'_>,
 	ev_stream: &'es mut EventStream,
-	tmux_offset: Option<(u16, u16)>
+	tmux_offset: Option<(u16, u16)>,
+	shms_work: bool
 ) -> Result<
 	(),
 	(
@@ -421,45 +430,84 @@ pub async fn display_kitty_images<'es>(
 					}
 				},
 				KittyImage::Dynamic(dynamic) => {
-					let mut png = Vec::new();
-					if let Err(e) = dynamic.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-					{
-						let e = err.get_or_insert_with(|| {
-							(
-								vec![],
-								TransmitError::Writing(std::io::Error::other(format!(
-									"Couldn't encode zoom image to PNG: {e}"
-								)))
-							)
-						});
-						e.0.push(page_num);
-						continue;
-					}
-					let image = Image {
-						num_or_id: NumberOrId::Id(
-							crate::image_id_base().saturating_add(page_num as u32)
-						),
-						format: PixelFormat::Png(None),
-						medium: Medium::Direct {
-							chunk_size: None,
-							data: png.into()
+					let image_id = crate::image_id_base().saturating_add(page_num as u32);
+					let mut image = if shms_work {
+						let pid = std::process::id();
+						let rn = SystemTime::now()
+							.duration_since(UNIX_EPOCH)
+							.unwrap_or_default()
+							.as_nanos() % 1_000_000;
+
+						#[cfg(unix)]
+						let shm_name = format!("/tdf_dynamic_{pid}_{rn}_{page_num}");
+						#[cfg(windows)]
+						let shm_name = format!("tdf_dynamic_{pid}_{rn}_{page_num}");
+
+						#[cfg(unix)]
+						let shm_name = &*shm_name;
+
+						kittage::image::Image::shm_from(dynamic.clone(), shm_name).unwrap_or_else(
+							|e| {
+								log::debug!(
+									"couldn't create shm zoom image for page {page_num}, falling back to direct transfer: {e:?}"
+								);
+								Image::from(dynamic)
+							}
+						)
+					} else {
+						let mut png = Vec::new();
+						if let Err(e) =
+							dynamic.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+						{
+							let e = err.get_or_insert_with(|| {
+								(
+									vec![],
+									TransmitError::Writing(std::io::Error::other(format!(
+										"Couldn't encode zoom image to PNG: {e}"
+									)))
+								)
+							});
+							e.0.push(page_num);
+							continue;
+						}
+
+						Image {
+							num_or_id: NumberOrId::Id(image_id),
+							format: PixelFormat::Png(None),
+							medium: Medium::Direct {
+								chunk_size: None,
+								data: png.into()
+							}
 						}
 					};
-					let pid = match image.num_or_id {
+
+					image.num_or_id = NumberOrId::Id(image_id);
+					let placement_id = match image.num_or_id {
 						NumberOrId::Id(id) => id,
 						NumberOrId::Number(n) => n
 					};
 					let action = Action::TransmitAndDisplay {
 						image,
 						config,
-						placement_id: Some(pid)
+						placement_id: Some(placement_id)
 					};
-					if let Err(e) = write_action_without_response(&action, tmux_offset) {
-						let e = err.get_or_insert_with(|| (vec![], TransmitError::Writing(e)));
-						e.0.push(page_num);
-						continue;
+
+					let res = if shms_work {
+						run_action(action, ev_stream, tmux_offset).await
+					} else {
+						write_action_without_response(&action, tmux_offset)
+							.map(|_| placement_id)
+							.map_err(TransmitError::Writing)
+					};
+
+					match res {
+						Ok(image_id) => image_id,
+						Err(e) => {
+							let e = err.get_or_insert_with(|| (vec![], e));
+							e.0.push(page_num);
+							continue;
+						}
 					}
-					pid
 				}
 			};
 

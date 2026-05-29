@@ -17,8 +17,8 @@ use crossterm::{
 	execute,
 	event::{DisableFocusChange, EnableFocusChange},
 	terminal::{
-		EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-		enable_raw_mode, window_size
+		BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+		disable_raw_mode, enable_raw_mode, window_size
 	}
 };
 use debounce::EventDebouncer;
@@ -427,7 +427,8 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		&mut term,
 		main_area,
 		font_size,
-		tmux_offset
+		tmux_offset,
+		shms_work
 	)
 	.await
 	.map_err(|e| {
@@ -462,7 +463,8 @@ async fn enter_redraw_loop(
 	term: &mut Terminal<CrosstermBackend<Stdout>>,
 	mut main_area: tdf::tui::RenderLayout,
 	font_size: FontSize,
-	tmux_offset: Option<(u16, u16)>
+	tmux_offset: Option<(u16, u16)>,
+	shms_work: bool
 ) -> Result<(), Box<dyn Error>> {
 	let mut app_focused = true;
 
@@ -562,13 +564,21 @@ async fn enter_redraw_loop(
 
 		if needs_redraw {
 			let mut to_display = KittyDisplay::NoChange;
-			term.draw(|f| {
-				to_display = tui.render(f, &main_area, font_size);
-			})?;
 
+			execute!(stdout().lock(), BeginSynchronizedUpdate)?;
+			let draw_result = term.draw(|f| {
+				to_display = tui.render(f, &main_area, font_size);
+			});
+
+			if let Err(e) = draw_result {
+				execute!(stdout().lock(), EndSynchronizedUpdate)?;
+				return Err(e.into());
+			}
+
+			let mut pages_to_rerender = Vec::new();
 			if app_focused {
 				if let Err((to_replace, err_desc, enum_err)) =
-					display_kitty_images(to_display, ev_stream, tmux_offset).await
+					display_kitty_images(to_display, ev_stream, tmux_offset, shms_work).await
 				{
 					match enum_err {
 						// This is the error that kitty & ghostty provide us when they delete
@@ -582,12 +592,16 @@ async fn enter_redraw_loop(
 
 					for page_num in to_replace {
 						tui.page_failed_display(page_num);
-						to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+						pages_to_rerender.push(page_num);
 					}
 				}
 			}
 
 			execute!(stdout().lock(), EndSynchronizedUpdate)?;
+
+			for page_num in pages_to_rerender {
+				to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+			}
 		}
 	}
 }

@@ -4,8 +4,7 @@ use crossterm::{
 	event::{Event, KeyCode, KeyModifiers, MouseEventKind},
 	execute,
 	terminal::{
-		BeginSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-		enable_raw_mode
+		EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode
 	}
 };
 use image::DynamicImage;
@@ -600,8 +599,6 @@ impl Tui {
 			Self::render_loading_in(frame, img_area);
 			KittyDisplay::ClearImages
 		} else {
-			execute!(stdout(), BeginSynchronizedUpdate).unwrap();
-
 			let total_width = page_sizes.iter().map(|(w, _, _)| w).sum::<u16>();
 
 			self.last_render.pages_shown = page_sizes.len();
