@@ -1,6 +1,8 @@
-use std::num::{NonZeroU32, NonZeroUsize};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+	num::{NonZeroU32, NonZeroUsize},
+	sync::OnceLock,
+	time::{SystemTime, UNIX_EPOCH}
+};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -13,17 +15,18 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub fn image_id_base() -> NonZeroU32 {
 	static BASE: OnceLock<NonZeroU32> = OnceLock::new();
 	*BASE.get_or_init(|| {
-		let pid = std::process::id() as u64;
+		let pid = u64::from(std::process::id());
 		let nanos = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.unwrap_or_default()
 			.as_nanos() as u64;
 		// Mix pid and time, mask to 24-bit range minus some headroom for pages
-		let mixed = pid.wrapping_mul(6364136223846793005).wrapping_add(nanos);
+		let mixed = pid
+			.wrapping_mul(6_364_136_223_846_793_005)
+			.wrapping_add(nanos);
 		let base = (mixed & 0x00FF_FFFF) as u32;
 		// Clamp to leave room for page offsets; ensure nonzero
 		let base = (base % 0x00FF_F000).max(1);
-		// SAFETY: max(1) guarantees nonzero
 		NonZeroU32::new(base).unwrap()
 	})
 }

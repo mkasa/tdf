@@ -13,9 +13,8 @@ use std::{
 };
 
 use crossterm::{
-	event::EventStream,
+	event::{DisableFocusChange, EnableFocusChange, EventStream},
 	execute,
-	event::{DisableFocusChange, EnableFocusChange},
 	terminal::{
 		BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 		disable_raw_mode, enable_raw_mode, window_size
@@ -205,19 +204,18 @@ async fn inner_main() -> Result<(), WrappedErr> {
 
 	// need to keep it around throughout the lifetime of the program, but don't rly need to use it.
 	// Just need to make sure it doesn't get dropped yet.
-	let maybe_logger = if std::env::var("RUST_LOG").is_ok() {
-		Some(
+	let maybe_logger = std::env::var("RUST_LOG")
+		.is_ok()
+		.then(|| {
 			flexi_logger::Logger::try_with_env()
 				.map_err(|e| WrappedErr(format!("Couldn't create initial logger: {e}").into()))?
 				.log_to_file(FileSpec::try_from("./debug.log").map_err(|e| {
 					WrappedErr(format!("Couldn't create FileSpec for logger: {e}").into())
 				})?)
 				.start()
-				.map_err(|e| WrappedErr(format!("Can't start logger: {e}").into()))?
-		)
-	} else {
-		None
-	};
+				.map_err(|e| WrappedErr(format!("Can't start logger: {e}").into()))
+		})
+		.transpose()?;
 
 	let (watch_to_render_tx, render_rx) = flume::unbounded();
 	let to_renderer = watch_to_render_tx.clone();
@@ -339,11 +337,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let (to_main, from_converter) = flume::unbounded();
 
 	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
-	let tmux_offset = if is_kitty && in_tmux {
-		Some(get_tmux_pane_offset().unwrap_or((0, 0)))
-	} else {
-		None
-	};
+	let tmux_offset = (is_kitty && in_tmux).then(|| get_tmux_pane_offset().unwrap_or((0, 0)));
 
 	let shms_work = is_kitty && do_shms_work(&mut ev_stream, tmux_offset).await;
 
@@ -405,12 +399,18 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		})?;
 
 	if initial_page > 0 {
-		to_renderer.send(RenderNotif::JumpToPage(initial_page)).map_err(|e| {
-			WrappedErr(format!("Couldn't inform the rendering thread of the initial page: {e}").into())
-		})?;
-		to_converter.send(ConverterMsg::GoToPage(initial_page)).map_err(|e| {
-			WrappedErr(format!("Couldn't inform the converter of the initial page: {e}").into())
-		})?;
+		to_renderer
+			.send(RenderNotif::JumpToPage(initial_page))
+			.map_err(|e| {
+				WrappedErr(
+					format!("Couldn't inform the rendering thread of the initial page: {e}").into()
+				)
+			})?;
+		to_converter
+			.send(ConverterMsg::GoToPage(initial_page))
+			.map_err(|e| {
+				WrappedErr(format!("Couldn't inform the converter of the initial page: {e}").into())
+			})?;
 	}
 
 	let tui_rx = tui_rx.into_stream();
@@ -441,9 +441,11 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	})?;
 
 	if is_kitty {
-		delete_kitty_images(&mut ev_stream, tmux_offset).await.map_err(|e| {
-			WrappedErr(format!("Couldn't delete Kitty images while exiting: {e}").into())
-		})?;
+		delete_kitty_images(&mut ev_stream, tmux_offset)
+			.await
+			.map_err(|e| {
+				WrappedErr(format!("Couldn't delete Kitty images while exiting: {e}").into())
+			})?;
 	}
 
 	drop(maybe_logger);
@@ -555,12 +557,12 @@ async fn enter_redraw_loop(
 		};
 
 		let new_area = Tui::main_layout(&term.get_frame(), fullscreen);
-			if new_area != main_area {
-				main_area = new_area;
-				tui.advance_render_generation();
-				to_renderer.send(RenderNotif::Area(main_area.page_area))?;
-				needs_redraw = true;
-			}
+		if new_area != main_area {
+			main_area = new_area;
+			tui.advance_render_generation();
+			to_renderer.send(RenderNotif::Area(main_area.page_area))?;
+			needs_redraw = true;
+		}
 
 		if needs_redraw {
 			let mut to_display = KittyDisplay::NoChange;
@@ -585,9 +587,9 @@ async fn enter_redraw_loop(
 						// an image due to memory constraints, so if we get it, we just fix
 						// it by re-rendering so it don't display it to the user
 						TransmitError::Terminal(TerminalError::NoEntity(_)) => (),
-						_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(
-							format!("{err_desc}: {enum_err}")
-						)))
+						_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+							"{err_desc}: {enum_err}"
+						))))
 					}
 
 					for page_num in to_replace {

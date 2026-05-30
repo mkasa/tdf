@@ -339,18 +339,18 @@ pub fn start_rendering(
 				};
 
 				// render the page
-					match render_single_page_to_ctx(
-						&page,
-						search_term.as_deref(),
-						rendered,
-						invert,
-						black,
-						white,
-						fit_or_fill,
-						render_scale,
-						rotate,
-						(area_w, area_h)
-					) {
+				match render_single_page_to_ctx(
+					&page,
+					search_term.as_deref(),
+					rendered,
+					invert,
+					black,
+					white,
+					fit_or_fill,
+					render_scale,
+					rotate,
+					(area_w, area_h)
+				) {
 					// If that fn returned Some, that means it needed to be re-rendered for some
 					// reason or another, so we're sending it here
 					Ok(ctx) => {

@@ -1,9 +1,9 @@
 use std::{
+	fmt::Write as _,
 	io::{Cursor, Write},
 	num::NonZeroU32,
 	time::{SystemTime, UNIX_EPOCH}
 };
-
 
 use crossterm::{
 	cursor::MoveTo,
@@ -13,8 +13,7 @@ use crossterm::{
 };
 use image::DynamicImage;
 use kittage::{
-	AsyncInputReader, ImageDimensions, ImageId, NumberOrId, PixelFormat,
-	Verbosity,
+	AsyncInputReader, ImageDimensions, ImageId, NumberOrId, PixelFormat, Verbosity,
 	action::Action,
 	delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
 	display::{CursorMovementPolicy, DisplayConfig, DisplayLocation},
@@ -70,7 +69,7 @@ pub struct KittyReadyToDisplay<'tui> {
 	pub pos: Position,
 	pub display_loc: DisplayLocation,
 	pub cell_w: u16,
-	pub cell_h: u16,
+	pub cell_h: u16
 }
 
 pub enum KittyImage<'tui> {
@@ -187,14 +186,18 @@ fn write_action_without_response(
 			#[cfg(debug_assertions)]
 			buf: String::new()
 		};
-		action.write_transmit_to(writer, Verbosity::Silent).map(|_| ())
+		action
+			.write_transmit_to(writer, Verbosity::Silent)
+			.map(|_| ())
 	} else {
 		let writer = DbgWriter {
 			w: std::io::stdout().lock(),
 			#[cfg(debug_assertions)]
 			buf: String::new()
 		};
-		action.write_transmit_to(writer, Verbosity::Silent).map(|_| ())
+		action
+			.write_transmit_to(writer, Verbosity::Silent)
+			.map(|_| ())
 	}
 }
 
@@ -244,8 +247,8 @@ async fn run_action_at<'es>(
 		write!(
 			writer,
 			"\x1b[{};{}H",
-			pos.y as u32 + row_off as u32 + 1,
-			pos.x as u32 + col_off as u32 + 1
+			u32::from(pos.y) + u32::from(row_off) + 1,
+			u32::from(pos.x) + u32::from(col_off) + 1
 		)
 		.unwrap();
 		action
@@ -274,15 +277,17 @@ fn write_unicode_placeholders(
 
 	let mut buf = String::new();
 	for row in 0..cell_h {
-		buf.push_str(&format!(
+		write!(
+			&mut buf,
 			"\x1b[{};{}H",
-			pos.y as u32 + row as u32 + 1,
-			pos.x as u32 + 1
-		));
-		buf.push_str(&format!("\x1b[38;2;{r};{g};{b}m"));
-		let row_diac = DIACRITICS[row as usize % 256];
+			u32::from(pos.y) + u32::from(row) + 1,
+			u32::from(pos.x) + 1
+		)
+		.expect("writing to String cannot fail");
+		write!(&mut buf, "\x1b[38;2;{r};{g};{b}m").expect("writing to String cannot fail");
+		let row_diac = DIACRITICS[usize::from(row) % 256];
 		for col in 0..cell_w {
-			let col_diac = DIACRITICS[col as usize % 256];
+			let col_diac = DIACRITICS[usize::from(col) % 256];
 			buf.push('\u{10EEEE}');
 			buf.push(row_diac);
 			buf.push(col_diac);
@@ -356,7 +361,7 @@ pub async fn display_kitty_images<'es>(
 			pos,
 			display_loc,
 			cell_w,
-			cell_h,
+			cell_h
 		} in images
 		{
 			let config = tmux_display_config(display_loc, cell_w, cell_h);
@@ -496,7 +501,7 @@ pub async fn display_kitty_images<'es>(
 						run_action(action, ev_stream, tmux_offset).await
 					} else {
 						write_action_without_response(&action, tmux_offset)
-							.map(|_| placement_id)
+							.map(|()| placement_id)
 							.map_err(TransmitError::Writing)
 					};
 

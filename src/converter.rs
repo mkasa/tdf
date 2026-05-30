@@ -75,7 +75,7 @@ pub struct ConvertedPage {
 pub enum ConverterMsg {
 	NumPages(usize),
 	GoToPage(usize),
-	AddImg(PageInfo),
+	AddImg(PageInfo)
 }
 
 pub async fn run_conversion_loop(
@@ -166,14 +166,12 @@ pub async fn run_conversion_loop(
 					#[cfg(unix)]
 					let shm_name = &*shm_name;
 
-					kittage::image::Image::shm_from(dyn_img.clone(), shm_name).unwrap_or_else(
-						|e| {
-							log::debug!(
-								"couldn't create shm image for page {page_num}, falling back to direct transfer: {e:?}"
-							);
-							kittage::image::Image::from(dyn_img)
-						}
-					)
+					kittage::image::Image::shm_from(dyn_img.clone(), shm_name).unwrap_or_else(|e| {
+						log::debug!(
+							"couldn't create shm image for page {page_num}, falling back to direct transfer: {e:?}"
+						);
+						kittage::image::Image::from(dyn_img)
+					})
 				} else {
 					kittage::image::Image::from(dyn_img)
 				};

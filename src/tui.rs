@@ -3,9 +3,7 @@ use std::{borrow::Cow, io::stdout, num::NonZeroUsize};
 use crossterm::{
 	event::{Event, KeyCode, KeyModifiers, MouseEventKind},
 	execute,
-	terminal::{
-		EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode
-	}
+	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode}
 };
 use image::DynamicImage;
 use kittage::display::DisplayLocation;
@@ -18,7 +16,10 @@ use ratatui::{
 	text::Span,
 	widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap}
 };
-use ratatui_image::{FontSize, Image, protocol::{Protocol, iterm2::Iterm2}};
+use ratatui_image::{
+	FontSize, Image,
+	protocol::{Protocol, iterm2::Iterm2}
+};
 
 use crate::{
 	converter::{ConvertedImage, MaybeTransferred},
@@ -234,6 +235,7 @@ impl Tui {
 		}
 	}
 
+	#[expect(clippy::too_many_arguments)]
 	fn render_zoomed<'s>(
 		// area of the 'fit-screen' page
 		mut img_area: Rect,
@@ -349,7 +351,7 @@ impl Tui {
 					..DisplayLocation::default()
 				},
 				cell_w: img_area.width,
-				cell_h: img_area.height,
+				cell_h: img_area.height
 			}]);
 		}
 
@@ -370,7 +372,7 @@ impl Tui {
 				..DisplayLocation::default()
 			},
 			cell_w: img_area.width,
-			cell_h: img_area.height,
+			cell_h: img_area.height
 		}])
 	}
 
@@ -459,8 +461,12 @@ impl Tui {
 
 		let is_tmux = matches!(protocol, Protocol::ITerm2(iterm) if iterm.is_tmux);
 		*protocol = Protocol::ITerm2(
-			Iterm2::new(resized, Rect::new(0, 0, img_area.width, img_area.height), is_tmux)
-				.expect("iTerm2 zoom protocol generation should succeed")
+			Iterm2::new(
+				resized,
+				Rect::new(0, 0, img_area.width, img_area.height),
+				is_tmux
+			)
+			.expect("iTerm2 zoom protocol generation should succeed")
 		);
 		frame.render_widget(Image::new(protocol), img_area);
 	}
@@ -543,10 +549,8 @@ impl Tui {
 					cell_h
 				);
 			}
-			if let Some(ConvertedImage::Generic {
-				protocol,
-				source
-			}) = self.rendered[self.page].img.as_mut()
+			if let Some(ConvertedImage::Generic { protocol, source }) =
+				self.rendered[self.page].img.as_mut()
 			{
 				self.last_render = LastRender {
 					rect: size,
@@ -627,7 +631,7 @@ impl Tui {
 						pos,
 						display_loc: DisplayLocation::default(),
 						cell_w: cw,
-						cell_h: ch,
+						cell_h: ch
 					})
 				})
 				.collect::<Vec<_>>();
@@ -660,10 +664,15 @@ impl Tui {
 				px_h: _,
 				cell_h,
 				cell_w
-			} => Some((img, Position {
-				x: img_area.x,
-				y: img_area.y
-			}, *cell_w, *cell_h))
+			} => Some((
+				img,
+				Position {
+					x: img_area.x,
+					y: img_area.y
+				},
+				*cell_w,
+				*cell_h
+			))
 		}
 	}
 
@@ -980,22 +989,22 @@ impl Tui {
 								self.last_render.rect = Rect::default();
 								Some(InputAction::Redraw)
 							}
-								'z' => {
-									let old_scale = self.current_render_scale();
-									self.zoom = match self.zoom {
-										None => Some(Zoom::default()),
-										Some(_) => None
-									};
-									self.last_render.rect = Rect::default();
-									let new_scale = self.current_render_scale();
-									if (new_scale - old_scale).abs() > f32::EPSILON {
-										Some(InputAction::SetRenderScale(new_scale))
-									} else {
-										Some(InputAction::Redraw)
-									}
+							'z' => {
+								let old_scale = self.current_render_scale();
+								self.zoom = match self.zoom {
+									None => Some(Zoom::default()),
+									Some(_) => None
+								};
+								self.last_render.rect = Rect::default();
+								let new_scale = self.current_render_scale();
+								if (new_scale - old_scale).abs() > f32::EPSILON {
+									Some(InputAction::SetRenderScale(new_scale))
+								} else {
+									Some(InputAction::Redraw)
 								}
-								'o' if can_zoom => self.update_zoom_level(Zoom::step_in),
-								'O' if can_zoom => self.update_zoom_level(Zoom::step_out),
+							}
+							'o' if can_zoom => self.update_zoom_level(Zoom::step_in),
+							'O' if can_zoom => self.update_zoom_level(Zoom::step_out),
 							'L' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
 							'H' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
 							'J' if can_zoom => self.update_zoom(|z| z.pan(Direction::Down)),
@@ -1137,6 +1146,7 @@ impl Tui {
 		Some(InputAction::Redraw)
 	}
 
+	#[expect(clippy::unnecessary_wraps)]
 	fn update_zoom_level(&mut self, f: impl FnOnce(&mut Zoom)) -> Option<InputAction> {
 		let old_scale = self.current_render_scale();
 		if let Some(z) = &mut self.zoom {
