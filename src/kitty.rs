@@ -1,3 +1,4 @@
+use core::fmt::Display;
 use std::{
 	fmt::Write as _,
 	io::{Cursor, Write},
@@ -22,6 +23,7 @@ use kittage::{
 	medium::Medium
 };
 use ratatui::layout::Position;
+use smallvec::SmallVec;
 
 use crate::converter::MaybeTransferred;
 
@@ -152,7 +154,7 @@ pub async fn run_action<'es>(
 	action: Action<'_, '_>,
 	ev_stream: &'es mut EventStream,
 	tmux_offset: Option<(u16, u16)>
-) -> Result<ImageId, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
+) -> Result<Option<ImageId>, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
 	if tmux_offset.is_some() {
 		let writer = DbgWriter {
 			w: TmuxPassthroughWriter::new(std::io::stdout().lock()),
@@ -236,7 +238,7 @@ async fn run_action_at<'es>(
 	ev_stream: &'es mut EventStream,
 	tmux_offset: Option<(u16, u16)>,
 	pos: Position
-) -> Result<ImageId, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
+) -> Result<Option<ImageId>, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
 	if let Some((col_off, row_off)) = tmux_offset {
 		let mut writer = DbgWriter {
 			w: TmuxPassthroughWriter::new(std::io::stdout().lock()),
@@ -316,56 +318,248 @@ fn tmux_display_config(display_loc: DisplayLocation, cell_w: u16, cell_h: u16) -
 	config
 }
 
+type ESTransErr<'es> = TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>;
+
+pub struct DisplayErr<'es> {
+	pub failed_pages: SmallVec<[usize; 2]>,
+	pub user_facing_err: &'static str,
+	pub source: DisplayErrSource<'es>
+}
+
+impl<'es> DisplayErr<'es> {
+	fn empty(user_facing_err: &'static str, source: ESTransErr<'es>) -> Self {
+		Self {
+			failed_pages: SmallVec::new(),
+			user_facing_err,
+			source: DisplayErrSource::Transmission(source)
+		}
+	}
+}
+
+#[derive(Debug)]
+pub enum DisplayErrSource<'es> {
+	KittageReturnedNoId,
+	Transmission(ESTransErr<'es>)
+}
+
+impl Display for DisplayErrSource<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::KittageReturnedNoId => write!(
+				f,
+				"Kittage returned no ID when we asked it to display an image. This is a bug in kittage, please report it."
+			),
+			Self::Transmission(t) => write!(f, "Error with talking to the terminal: {t}")
+		}
+	}
+}
+
 pub async fn display_kitty_images<'es>(
 	display: KittyDisplay<'_>,
 	ev_stream: &'es mut EventStream,
 	tmux_offset: Option<(u16, u16)>,
-	shms_work: bool
-) -> Result<
-	(),
-	(
-		Vec<usize>,
-		&'static str,
-		TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>
-	)
-> {
+	shms_work: bool,
+	last_z_index: &mut i32
+) -> Result<(), DisplayErr<'es>> {
 	let images = match display {
 		KittyDisplay::NoChange => return Ok(()),
-		KittyDisplay::DisplayImages(_) | KittyDisplay::ClearImages => {
-			if tmux_offset.is_none() {
-				run_action(
-					Action::Delete(DeleteConfig {
-						effect: ClearOrDelete::Clear,
-						which: WhichToDelete::All
-					}),
-					ev_stream,
-					None
-				)
-				.await
-				.map_err(|e| (vec![], "Couldn't clear previous images", e))?;
-			}
-
-			let KittyDisplay::DisplayImages(images) = display else {
-				return Ok(());
-			};
-
-			images
-		}
+		KittyDisplay::ClearImages =>
+			return run_action(
+				Action::Delete(DeleteConfig {
+					effect: ClearOrDelete::Clear,
+					which: WhichToDelete::All
+				}),
+				ev_stream,
+				tmux_offset
+			)
+			.await
+			.map_err(|e| DisplayErr::empty("Couldn't clear previous images", e))
+			.map(|_: Option<ImageId>| ()),
+		KittyDisplay::DisplayImages(imgs) => imgs
 	};
 
-	if tmux_offset.is_some() {
-		let mut err = None;
-		for KittyReadyToDisplay {
-			img,
-			page_num,
-			pos,
-			display_loc,
-			cell_w,
-			cell_h
-		} in images
-		{
+	let new_z_index = last_z_index.wrapping_add_unsigned(1);
+
+	let mut err = Ok::<(), (SmallVec<[usize; 2]>, DisplayErrSource<'es>)>(());
+	for KittyReadyToDisplay {
+		img,
+		page_num,
+		pos,
+		mut display_loc,
+		cell_w,
+		cell_h
+	} in images
+	{
+		display_loc.z_index = new_z_index;
+
+		let this_err = if tmux_offset.is_some() {
 			let config = tmux_display_config(display_loc, cell_w, cell_h);
-			let image_id = match img {
+			match img {
+				KittyImage::Cached(image_state) => {
+					let image_id = match image_state {
+						MaybeTransferred::NotYet(image) => {
+							let mut fake_image = Image {
+								num_or_id: image.num_or_id,
+								format: PixelFormat::Rgb24(
+									ImageDimensions {
+										width: 0,
+										height: 0
+									},
+									None
+								),
+								medium: Medium::Direct {
+									chunk_size: None,
+									data: (&[]).into()
+								}
+							};
+							std::mem::swap(image, &mut fake_image);
+
+							let pid = match fake_image.num_or_id {
+								NumberOrId::Id(id) => id,
+								NumberOrId::Number(n) => n
+							};
+
+							run_action(
+								Action::TransmitAndDisplay {
+									image: fake_image,
+									config,
+									placement_id: Some(pid)
+								},
+								ev_stream,
+								tmux_offset
+							)
+							.await
+							.map_err(DisplayErrSource::Transmission)
+							.and_then(|img_id| {
+								img_id
+									.inspect(|&id| {
+										*image_state = MaybeTransferred::Transferred(id);
+									})
+									.ok_or(DisplayErrSource::KittageReturnedNoId)
+							})
+						}
+						MaybeTransferred::Transferred(image_id) => run_action(
+							Action::Display {
+								image_id: *image_id,
+								placement_id: *image_id,
+								config
+							},
+							ev_stream,
+							tmux_offset
+						)
+						.await
+						.map(|_: Option<ImageId>| *image_id)
+						.map_err(DisplayErrSource::Transmission)
+					};
+
+					image_id.and_then(|image_id| {
+						write_unicode_placeholders(
+							&mut std::io::stdout().lock(),
+							image_id.get(),
+							pos,
+							cell_w,
+							cell_h
+						)
+						.map_err(|e| DisplayErrSource::Transmission(TransmitError::Writing(e)))
+					})
+				}
+				KittyImage::Dynamic(dynamic) => {
+					let image_id = crate::image_id_base().saturating_add(page_num as u32);
+					let image = if shms_work {
+						let pid = std::process::id();
+						let rn = SystemTime::now()
+							.duration_since(UNIX_EPOCH)
+							.unwrap_or_default()
+							.as_nanos() % 1_000_000;
+
+						#[cfg(unix)]
+						let shm_name = format!("/tdf_dynamic_{pid}_{rn}_{page_num}");
+						#[cfg(windows)]
+						let shm_name = format!("tdf_dynamic_{pid}_{rn}_{page_num}");
+
+						#[cfg(unix)]
+						let shm_name = &*shm_name;
+
+						Ok(kittage::image::Image::shm_from(dynamic.clone(), shm_name).unwrap_or_else(
+							|e| {
+								log::debug!(
+									"couldn't create shm zoom image for page {page_num}, falling back to direct transfer: {e:?}"
+								);
+								Image::from(dynamic)
+							}
+						))
+					} else {
+						let mut png = Vec::new();
+						dynamic
+							.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+							.map(|()| Image {
+								num_or_id: NumberOrId::Id(image_id),
+								format: PixelFormat::Png(None),
+								medium: Medium::Direct {
+									chunk_size: None,
+									data: png.into()
+								}
+							})
+							.map_err(|e| {
+								DisplayErrSource::Transmission(TransmitError::Writing(
+									std::io::Error::other(format!(
+										"Couldn't encode zoom image to PNG: {e}"
+									))
+								))
+							})
+					};
+
+					match image {
+						Ok(mut image) => {
+							image.num_or_id = NumberOrId::Id(image_id);
+							let placement_id = match image.num_or_id {
+								NumberOrId::Id(id) => id,
+								NumberOrId::Number(n) => n
+							};
+							let action = Action::TransmitAndDisplay {
+								image,
+								config,
+								placement_id: Some(placement_id)
+							};
+
+							let transfer = if shms_work {
+								run_action(action, ev_stream, tmux_offset).await
+							} else {
+								write_action_without_response(&action, tmux_offset)
+									.map(|()| Some(placement_id))
+									.map_err(TransmitError::Writing)
+							};
+
+							transfer
+								.map_err(DisplayErrSource::Transmission)
+								.and_then(|img_id| {
+									img_id.ok_or(DisplayErrSource::KittageReturnedNoId)
+								})
+								.and_then(|_| {
+									write_unicode_placeholders(
+										&mut std::io::stdout().lock(),
+										placement_id.get(),
+										pos,
+										cell_w,
+										cell_h
+									)
+									.map_err(|e| {
+										DisplayErrSource::Transmission(TransmitError::Writing(e))
+									})
+								})
+						}
+						Err(e) => Err(e)
+					}
+				}
+			}
+		} else {
+			let config = DisplayConfig {
+				location: display_loc,
+				cursor_movement: CursorMovementPolicy::DontMove,
+				..DisplayConfig::default()
+			};
+
+			match img {
 				KittyImage::Cached(image_state) => match image_state {
 					MaybeTransferred::NotYet(image) => {
 						let mut fake_image = Image {
@@ -384,233 +578,72 @@ pub async fn display_kitty_images<'es>(
 						};
 						std::mem::swap(image, &mut fake_image);
 
-						let pid = match fake_image.num_or_id {
-							NumberOrId::Id(id) => id,
-							NumberOrId::Number(n) => n
-						};
-
-						let res = run_action(
+						run_action_at(
 							Action::TransmitAndDisplay {
 								image: fake_image,
 								config,
-								placement_id: Some(pid)
+								placement_id: None
 							},
 							ev_stream,
-							tmux_offset
+							tmux_offset,
+							pos
 						)
-						.await;
-
-						match res {
-							Ok(img_id) => {
-								*image_state = MaybeTransferred::Transferred(img_id);
-								img_id
-							}
-							Err(e) => {
-								let e = err.get_or_insert_with(|| (vec![], e));
-								e.0.push(page_num);
-								continue;
-							}
-						}
+						.await
+						.map_err(DisplayErrSource::Transmission)
+						.and_then(|img_id| {
+							img_id
+								.map(|id| *image_state = MaybeTransferred::Transferred(id))
+								.ok_or(DisplayErrSource::KittageReturnedNoId)
+						})
 					}
-					MaybeTransferred::Transferred(image_id) => {
-						let res = run_action(
-							Action::Display {
-								image_id: *image_id,
-								placement_id: *image_id,
-								config
-							},
-							ev_stream,
-							tmux_offset
-						)
-						.await;
-
-						match res {
-							Ok(_) => *image_id,
-							Err(e) => {
-								let e = err.get_or_insert_with(|| (vec![], e));
-								e.0.push(page_num);
-								continue;
-							}
-						}
-					}
-				},
-				KittyImage::Dynamic(dynamic) => {
-					let image_id = crate::image_id_base().saturating_add(page_num as u32);
-					let mut image = if shms_work {
-						let pid = std::process::id();
-						let rn = SystemTime::now()
-							.duration_since(UNIX_EPOCH)
-							.unwrap_or_default()
-							.as_nanos() % 1_000_000;
-
-						#[cfg(unix)]
-						let shm_name = format!("/tdf_dynamic_{pid}_{rn}_{page_num}");
-						#[cfg(windows)]
-						let shm_name = format!("tdf_dynamic_{pid}_{rn}_{page_num}");
-
-						#[cfg(unix)]
-						let shm_name = &*shm_name;
-
-						kittage::image::Image::shm_from(dynamic.clone(), shm_name).unwrap_or_else(
-							|e| {
-								log::debug!(
-									"couldn't create shm zoom image for page {page_num}, falling back to direct transfer: {e:?}"
-								);
-								Image::from(dynamic)
-							}
-						)
-					} else {
-						let mut png = Vec::new();
-						if let Err(e) =
-							dynamic.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
-						{
-							let e = err.get_or_insert_with(|| {
-								(
-									vec![],
-									TransmitError::Writing(std::io::Error::other(format!(
-										"Couldn't encode zoom image to PNG: {e}"
-									)))
-								)
-							});
-							e.0.push(page_num);
-							continue;
-						}
-
-						Image {
-							num_or_id: NumberOrId::Id(image_id),
-							format: PixelFormat::Png(None),
-							medium: Medium::Direct {
-								chunk_size: None,
-								data: png.into()
-							}
-						}
-					};
-
-					image.num_or_id = NumberOrId::Id(image_id);
-					let placement_id = match image.num_or_id {
-						NumberOrId::Id(id) => id,
-						NumberOrId::Number(n) => n
-					};
-					let action = Action::TransmitAndDisplay {
-						image,
-						config,
-						placement_id: Some(placement_id)
-					};
-
-					let res = if shms_work {
-						run_action(action, ev_stream, tmux_offset).await
-					} else {
-						write_action_without_response(&action, tmux_offset)
-							.map(|()| placement_id)
-							.map_err(TransmitError::Writing)
-					};
-
-					match res {
-						Ok(image_id) => image_id,
-						Err(e) => {
-							let e = err.get_or_insert_with(|| (vec![], e));
-							e.0.push(page_num);
-							continue;
-						}
-					}
-				}
-			};
-
-			write_unicode_placeholders(
-				&mut std::io::stdout().lock(),
-				image_id.get(),
-				pos,
-				cell_w,
-				cell_h
-			)
-			.unwrap();
-		}
-
-		return match err {
-			Some((replace, e)) => Err((replace, "Couldn't transfer image to the terminal", e)),
-			None => Ok(())
-		};
-	}
-
-	let mut err = None;
-	for KittyReadyToDisplay {
-		img,
-		page_num,
-		pos,
-		display_loc,
-		..
-	} in images
-	{
-		let config = DisplayConfig {
-			location: display_loc,
-			cursor_movement: CursorMovementPolicy::DontMove,
-			..DisplayConfig::default()
-		};
-
-		let this_err = match img {
-			KittyImage::Cached(image_state) => match image_state {
-				MaybeTransferred::NotYet(image) => {
-					let mut fake_image = Image {
-						num_or_id: image.num_or_id,
-						format: PixelFormat::Rgb24(
-							ImageDimensions {
-								width: 0,
-								height: 0
-							},
-							None
-						),
-						medium: Medium::Direct {
-							chunk_size: None,
-							data: (&[]).into()
-						}
-					};
-					std::mem::swap(image, &mut fake_image);
-
-					let res = run_action_at(
-						Action::TransmitAndDisplay {
-							image: fake_image,
-							config,
-							placement_id: None
+					MaybeTransferred::Transferred(image_id) => run_action_at(
+						Action::Display {
+							image_id: *image_id,
+							placement_id: *image_id,
+							config
 						},
 						ev_stream,
 						tmux_offset,
 						pos
 					)
-					.await;
-
-					match res {
-						Ok(img_id) => {
-							*image_state = MaybeTransferred::Transferred(img_id);
-							Ok(())
-						}
-						Err(e) => Err((page_num, e))
-					}
-				}
-				MaybeTransferred::Transferred(image_id) => run_action_at(
-					Action::Display {
-						image_id: *image_id,
-						placement_id: *image_id,
-						config
-					},
-					ev_stream,
-					tmux_offset,
-					pos
-				)
-				.await
-				.map(|_| ())
-				.map_err(|e| (page_num, e))
-			},
-			KittyImage::Dynamic(_) => unreachable!("dynamic kitty images are only used under tmux")
+					.await
+					.map(|_: Option<ImageId>| ())
+					.map_err(DisplayErrSource::Transmission)
+				},
+				KittyImage::Dynamic(_) =>
+					unreachable!("dynamic kitty images are only used under tmux"),
+			}
 		};
 
-		if let Err((id, e)) = this_err {
-			let e = err.get_or_insert_with(|| (vec![], e));
-			e.0.push(id);
+		log::debug!("this_err is {this_err:#?}");
+
+		if let Err(e) = this_err {
+			match err.as_mut() {
+				Ok(()) => err = Err((SmallVec::from([page_num].as_slice()), e)),
+				Err((v, _)) => v.push(page_num)
+			}
 		}
 	}
 
+	let z_idxes_to_remove = *last_z_index;
+	*last_z_index = new_z_index;
+
 	match err {
-		Some((replace, e)) => Err((replace, "Couldn't transfer image to the terminal", e)),
-		None => Ok(())
+		Err((failed_pages, source)) => Err(DisplayErr {
+			failed_pages,
+			user_facing_err: "Couldn't transfer image to the terminal",
+			source
+		}),
+		Ok(()) => run_action(
+			Action::Delete(DeleteConfig {
+				effect: ClearOrDelete::Clear,
+				which: WhichToDelete::PlacementsWithZIndex(z_idxes_to_remove)
+			}),
+			ev_stream,
+			tmux_offset
+		)
+		.await
+		.map_err(|e| DisplayErr::empty("Couldn't clear previously-sent images", e))
+		.map(|_| ())
 	}
 }

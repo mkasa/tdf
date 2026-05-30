@@ -38,7 +38,9 @@ use ratatui_image::{
 use tdf::{
 	PrerenderLimit,
 	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
-	kitty::{KittyDisplay, display_kitty_images, do_shms_work, run_action},
+	kitty::{
+		DisplayErr, DisplayErrSource, KittyDisplay, display_kitty_images, do_shms_work, run_action
+	},
 	renderer::{self, MUPDF_BLACK, MUPDF_WHITE, RenderError, RenderInfo, RenderNotif},
 	tui::{BottomMessage, InputAction, MessageSetting, Tui}
 };
@@ -469,6 +471,7 @@ async fn enter_redraw_loop(
 	shms_work: bool
 ) -> Result<(), Box<dyn Error>> {
 	let mut app_focused = true;
+	let mut kitty_z_idx = i32::MIN;
 
 	loop {
 		let mut needs_redraw = true;
@@ -579,20 +582,34 @@ async fn enter_redraw_loop(
 
 			let mut pages_to_rerender = Vec::new();
 			if app_focused {
-				if let Err((to_replace, err_desc, enum_err)) =
-					display_kitty_images(to_display, ev_stream, tmux_offset, shms_work).await
+				let maybe_err = display_kitty_images(
+					to_display,
+					ev_stream,
+					tmux_offset,
+					shms_work,
+					&mut kitty_z_idx
+				)
+				.await;
+
+				if let Err(DisplayErr {
+					failed_pages,
+					user_facing_err,
+					source
+				}) = maybe_err
 				{
-					match enum_err {
+					match source {
 						// This is the error that kitty & ghostty provide us when they delete
 						// an image due to memory constraints, so if we get it, we just fix
 						// it by re-rendering so it don't display it to the user
-						TransmitError::Terminal(TerminalError::NoEntity(_)) => (),
+						DisplayErrSource::Transmission(TransmitError::Terminal(
+							TerminalError::NoEntity(_)
+						)) => (),
 						_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
-							"{err_desc}: {enum_err}"
+							"{user_facing_err}: {source}"
 						))))
 					}
 
-					for page_num in to_replace {
+					for page_num in failed_pages {
 						tui.page_failed_display(page_num);
 						pages_to_rerender.push(page_num);
 					}

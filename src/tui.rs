@@ -74,7 +74,7 @@ struct PageConstraints {
 	r_to_l: bool
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 struct Zoom {
 	// just how much 'zoom' you have. 0 means it fills the screen (instead of fits), such
 	// that one axis is fully on-screen
@@ -88,7 +88,7 @@ struct Zoom {
 }
 impl Zoom {
 	/// Returns the zoom factor, where 1 is the default and means fill-screen
-	fn factor(&self) -> f32 {
+	fn factor(self) -> f32 {
 		// TODO: Make these configurable once we have a good way to set options after startup
 		const ZOOM_RATE: f32 = 1.1;
 		const ZOOM_RATE_GRANULAR: f32 = 1.05;
@@ -268,7 +268,7 @@ impl Tui {
 			let img_page_w_ratio = f32::from(img_cell_w) / initial_page_w;
 			let img_page_h_ratio = f32::from(img_cell_h) / initial_page_h;
 
-			let shrink_move_page = |dim: &mut u16, pos: &mut u16, axis_zoom_factor: f32| {
+			fn shrink_move_page(dim: &mut u16, pos: &mut u16, axis_zoom_factor: f32) {
 				let old_dim = *dim;
 				// The axis zoom factor tells us what portion of the axis
 				// we need to show.
@@ -278,26 +278,56 @@ impl Tui {
 					.checked_sub(*dim)
 					.expect("zooming out should shrink the image")
 					/ 2;
-			};
-
-			// TODO: Detect max zoom-out in zoom levels
-			if img_page_w_ratio < img_page_h_ratio {
-				// vertical scroll / tall image. zooming out means decreasing the width of the page area
-				shrink_move_page(
-					&mut img_area.width,
-					&mut img_area.x,
-					// disallow zooming out past fit-screen
-					zoom_factor.max(img_page_h_ratio)
-				);
-			} else {
-				// horizontal scroll / wide image. zooming out means decreasing the width of the page area
-				shrink_move_page(
-					&mut img_area.height,
-					&mut img_area.y,
-					// disallow zooming out past fit-screen
-					zoom_factor.max(img_page_w_ratio)
-				);
 			}
+
+			fn shrink_move_two_pass(
+				zoom: &mut Zoom,
+				dim: &mut u16,
+				pos: &mut u16,
+				zoom_factor: f32,
+				axis_zoom_factor: f32
+			) {
+				// To detect if we're already at fit-screen, we perform a first
+				// pass on `img_area` that emulates the last call to
+				// `render_zoomed` by subtracting from the `zoom`'s level. This
+				// holds because the `img_area` that gets passed is always the
+				// same.
+				let mut first_pass_dim = *dim;
+				let mut first_pass_pos = *pos;
+				let mut first_pass_zoom = *zoom;
+
+				if first_pass_zoom.level.is_negative() {
+					first_pass_zoom.step_in();
+				}
+				let first_pass_zoom_factor = first_pass_zoom.factor();
+				shrink_move_page(
+					&mut first_pass_dim,
+					&mut first_pass_pos,
+					first_pass_zoom_factor.max(1.0 / axis_zoom_factor)
+				);
+
+				log::debug!("first_pass_dim: {first_pass_dim}, first_pass_pos: {first_pass_pos}");
+				// vertical scroll / tall image. zooming out means decreasing
+				// the width of the page area
+				// use `max` to disallow zooming out past fit-screen
+				shrink_move_page(dim, pos, zoom_factor.max(1.0 / axis_zoom_factor));
+
+				log::debug!("new dim: {dim}, new pos: {pos}");
+				// The moment the image area is left unmodified, we've hit
+				// fit-screen and the zoom level ought be normalized.
+				if first_pass_dim == *dim && first_pass_pos == *pos {
+					zoom.step_in();
+				}
+			}
+
+			let (dim, pos, axis_zoom_factor) = if img_page_w_ratio < img_page_h_ratio {
+				(&mut img_area.width, &mut img_area.x, img_page_h_ratio)
+			} else {
+				// horizontal scroll / wide image. zooming out means decreasing
+				// the height of the page area
+				(&mut img_area.height, &mut img_area.y, img_page_w_ratio)
+			};
+			shrink_move_two_pass(zoom, dim, pos, zoom_factor, axis_zoom_factor);
 		}
 		let target_px_w = f32::from(img_area.width) * f32::from(font_size.0);
 		let target_px_h = f32::from(img_area.height) * f32::from(font_size.1);
@@ -864,166 +894,146 @@ impl Tui {
 			InputAction::JumpingToPage(new_page)
 		}
 
-		let can_zoom = self.zoom.is_some();
+		let can_zoom = self.is_kitty && self.zoom.is_some();
 
 		match ev {
 			Event::Key(key) => {
 				match key.code {
-					KeyCode::Char(c) => {
-						// TODO: refactor back to `if let` arm guards when those are stabilized
+					KeyCode::Char(c)
 						if let BottomMessage::Input(InputCommand::Search(ref mut term)) =
-							self.bottom_msg
-						{
-							term.push(c);
-							return Some(InputAction::Redraw);
-						}
-
-						if let BottomMessage::Input(InputCommand::GoToPage(ref mut page)) =
-							self.bottom_msg
-						{
-							if c == 'g' && self.is_kitty {
-								self.update_zoom(Zoom::pan_bottom);
-								self.set_msg(MessageSetting::Pop);
-								return Some(InputAction::Redraw);
-							}
-
-							return c.to_digit(10).map(|input_num| {
-								*page = (*page * 10) + input_num as usize;
-								InputAction::Redraw
-							});
-						}
-
-						match c {
-							'l' => self.change_page(PageChange::Next, ChangeAmount::Single),
-							'j' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
-							'h' => self.change_page(PageChange::Prev, ChangeAmount::Single),
-							'k' => self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
-							'q' => Some(InputAction::QuitApp),
-							'g' => {
-								self.set_msg(MessageSetting::Some(BottomMessage::Input(
-									InputCommand::GoToPage(0)
-								)));
-								Some(InputAction::Redraw)
-							}
-							'/' => {
-								self.set_msg(MessageSetting::Some(BottomMessage::Input(
-									InputCommand::Search(String::new())
-								)));
-								Some(InputAction::Redraw)
-							}
-							'i' => Some(InputAction::Invert),
-							'?' => {
-								self.showing_help_msg = true;
-								Some(InputAction::Redraw)
-							}
-							'f' => Some(InputAction::Fullscreen),
-							'n' if self.page < self.rendered.len() - 1 => {
-								// TODO: If we can't find one, then maybe like block until we've verified
-								// all the pages have been checked?
-								self.rendered[(self.page + 1)..]
-									.iter()
-									.enumerate()
-									.find_map(|(idx, p)| {
-										p.num_results
-											.is_some_and(|num| num > 0)
-											.then_some(self.page + 1 + idx)
-									})
-									.map(|next_page| {
-										jump_to_page(
-											&mut self.page,
-											&mut self.last_render.rect,
-											next_page
-										)
-									})
-							}
-							'N' if self.page > 0 => self.rendered[..(self.page)]
-								.iter()
-								.rev()
-								.enumerate()
-								.find_map(|(idx, p)| {
-									p.num_results
-										.is_some_and(|num| num > 0)
-										.then_some(self.page - (idx + 1))
-								})
-								.map(|prev_page| {
-									jump_to_page(
-										&mut self.page,
-										&mut self.last_render.rect,
-										prev_page
-									)
-								}),
-							'z' if key.modifiers.contains(KeyModifiers::CONTROL) => {
-								// [todo] better error handling here?
-
-								let mut backend = stdout();
-								execute!(
-									&mut backend,
-									LeaveAlternateScreen,
-									crossterm::cursor::Show,
-									crossterm::event::DisableMouseCapture
-								)
-								.unwrap();
-								disable_raw_mode().unwrap();
-
-								#[cfg(unix)]
-								{
-									// This process will hang after the SIGSTOP call until we get
-									// foregrounded again by something else, at which point we need to
-									// re-setup everything so that it all gets drawn again.
-									nix::sys::signal::kill(
-										nix::unistd::Pid::this(),
-										nix::sys::signal::Signal::SIGSTOP
-									)
-									.unwrap();
-								}
-
-								enable_raw_mode().unwrap();
-								execute!(
-									&mut backend,
-									EnterAlternateScreen,
-									crossterm::cursor::Hide,
-									crossterm::event::EnableMouseCapture
-								)
-								.unwrap();
-
-								self.last_render.rect = Rect::default();
-								Some(InputAction::Redraw)
-							}
-							'z' => {
-								let old_scale = self.current_render_scale();
-								self.zoom = match self.zoom {
-									None => Some(Zoom::default()),
-									Some(_) => None
-								};
-								self.last_render.rect = Rect::default();
-								let new_scale = self.current_render_scale();
-								if (new_scale - old_scale).abs() > f32::EPSILON {
-									Some(InputAction::SetRenderScale(new_scale))
-								} else {
-									Some(InputAction::Redraw)
-								}
-							}
-							'o' if can_zoom => self.update_zoom_level(Zoom::step_in),
-							'O' if can_zoom => self.update_zoom_level(Zoom::step_out),
-							'L' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
-							'H' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
-							'J' if can_zoom => self.update_zoom(|z| z.pan(Direction::Down)),
-							'K' if can_zoom => self.update_zoom(|z| z.pan(Direction::Up)),
-							'G' if can_zoom => self.update_zoom(Zoom::pan_top),
-							'0' if can_zoom => self.update_zoom(Zoom::pan_left),
-							'$' if can_zoom => self.update_zoom(Zoom::pan_right),
-							'r' => Some(InputAction::Rotate),
-							_ => None
-						}
+							self.bottom_msg =>
+					{
+						term.push(c);
+						InputAction::Redraw.into()
 					}
-					KeyCode::Backspace => {
-						if let BottomMessage::Input(InputCommand::Search(ref mut term)) =
-							self.bottom_msg
-						{
-							term.pop();
-							return Some(InputAction::Redraw);
+					KeyCode::Char(c)
+						if let BottomMessage::Input(InputCommand::GoToPage(ref mut page)) =
+							self.bottom_msg && matches!(c, 'g' if self.is_kitty) =>
+						c.to_digit(10).map(|input_num| {
+							*page = (*page * 10) + input_num as usize;
+							InputAction::Redraw
+						}),
+					KeyCode::Char(_)
+						if let BottomMessage::Input(InputCommand::GoToPage(_)) =
+							self.bottom_msg =>
+					{
+						self.set_msg(MessageSetting::Pop);
+						self.update_zoom(Zoom::pan_bottom)
+					}
+					KeyCode::Char(c) => match c {
+						'l' => self.change_page(PageChange::Next, ChangeAmount::Single),
+						'j' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
+						'h' => self.change_page(PageChange::Prev, ChangeAmount::Single),
+						'k' => self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
+						'q' => Some(InputAction::QuitApp),
+						'g' => {
+							self.set_msg(MessageSetting::Some(BottomMessage::Input(
+								InputCommand::GoToPage(0)
+							)));
+							Some(InputAction::Redraw)
 						}
-						None
+						'/' => {
+							self.set_msg(MessageSetting::Some(BottomMessage::Input(
+								InputCommand::Search(String::new())
+							)));
+							Some(InputAction::Redraw)
+						}
+						'i' => Some(InputAction::Invert),
+						'?' => {
+							self.showing_help_msg = true;
+							Some(InputAction::Redraw)
+						}
+						'f' => Some(InputAction::Fullscreen),
+						// TODO: If we can't find one, then maybe like block until we've verified
+						// all the pages have been checked?
+						'n' if self.page < self.rendered.len() - 1 => self.rendered
+							[(self.page + 1)..]
+							.iter()
+							.enumerate()
+							.find_map(|(idx, p)| {
+								p.num_results
+									.is_some_and(|num| num > 0)
+									.then_some(self.page + 1 + idx)
+							})
+							.map(|next_page| {
+								jump_to_page(&mut self.page, &mut self.last_render.rect, next_page)
+							}),
+						'N' if self.page > 0 => self.rendered[..(self.page)]
+							.iter()
+							.rev()
+							.enumerate()
+							.find_map(|(idx, p)| {
+								p.num_results
+									.is_some_and(|num| num > 0)
+									.then_some(self.page - (idx + 1))
+							})
+							.map(|prev_page| {
+								jump_to_page(&mut self.page, &mut self.last_render.rect, prev_page)
+							}),
+						'z' if key.modifiers.contains(KeyModifiers::CONTROL) => {
+							// [todo] better error handling here?
+
+							let mut backend = stdout();
+							execute!(
+								&mut backend,
+								LeaveAlternateScreen,
+								crossterm::cursor::Show,
+								crossterm::event::DisableMouseCapture
+							)
+							.unwrap();
+							disable_raw_mode().unwrap();
+
+							#[cfg(unix)]
+							{
+								// This process will hang after the SIGSTOP call until we get
+								// foregrounded again by something else, at which point we need to
+								// re-setup everything so that it all gets drawn again.
+								nix::sys::signal::kill(
+									nix::unistd::Pid::this(),
+									nix::sys::signal::Signal::SIGSTOP
+								)
+								.unwrap();
+							}
+
+							enable_raw_mode().unwrap();
+							execute!(
+								&mut backend,
+								EnterAlternateScreen,
+								crossterm::cursor::Hide,
+								crossterm::event::EnableMouseCapture
+							)
+							.unwrap();
+
+							self.last_render.rect = Rect::default();
+							Some(InputAction::Redraw)
+						}
+						'z' if self.is_kitty => {
+							let (zoom, f_or_f) = match self.zoom {
+								None => (Some(Zoom::default()), crate::FitOrFill::Fill),
+								Some(_) => (None, crate::FitOrFill::Fit)
+							};
+							self.zoom = zoom;
+							self.last_render.rect = Rect::default();
+							Some(InputAction::SwitchRenderZoom(f_or_f))
+						}
+						'o' if can_zoom => self.update_zoom(Zoom::step_in),
+						'O' if can_zoom => self.update_zoom(Zoom::step_out),
+						'L' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
+						'H' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
+						'J' if can_zoom => self.update_zoom(|z| z.pan(Direction::Down)),
+						'K' if can_zoom => self.update_zoom(|z| z.pan(Direction::Up)),
+						'G' if can_zoom => self.update_zoom(Zoom::pan_top),
+						'0' if can_zoom => self.update_zoom(Zoom::pan_left),
+						'$' if can_zoom => self.update_zoom(Zoom::pan_right),
+						'r' => Some(InputAction::Rotate),
+						_ => None
+					},
+					KeyCode::Backspace
+						if let BottomMessage::Input(InputCommand::Search(ref mut term)) =
+							self.bottom_msg =>
+					{
+						term.pop();
+						InputAction::Redraw.into()
 					}
 					KeyCode::Right => self.change_page(PageChange::Next, ChangeAmount::Single),
 					KeyCode::Down | KeyCode::PageDown =>
@@ -1144,28 +1154,6 @@ impl Tui {
 		}
 		self.last_render.rect = Rect::default();
 		Some(InputAction::Redraw)
-	}
-
-	#[expect(clippy::unnecessary_wraps)]
-	fn update_zoom_level(&mut self, f: impl FnOnce(&mut Zoom)) -> Option<InputAction> {
-		let old_scale = self.current_render_scale();
-		if let Some(z) = &mut self.zoom {
-			f(z);
-		}
-		self.last_render.rect = Rect::default();
-		let new_scale = self.current_render_scale();
-		if (new_scale - old_scale).abs() > f32::EPSILON {
-			Some(InputAction::SetRenderScale(new_scale))
-		} else {
-			Some(InputAction::Redraw)
-		}
-	}
-
-	fn current_render_scale(&self) -> f32 {
-		self.zoom
-			.as_ref()
-			.filter(|zoom| zoom.level > 0)
-			.map_or(1.0, Zoom::factor)
 	}
 
 	pub fn advance_render_generation(&mut self) {

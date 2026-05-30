@@ -11,7 +11,7 @@ license = "AGPL-3.0-only"
 keywords = ["pdf", "tui", "cli", "terminal"]
 categories = ["command-line-utilities", "text-processing", "visualization"]
 default-run = "tdf"
-rust-version = "1.86"
+rust-version = "1.95"
 
 [[bin]]
 name = "tdf"
@@ -41,10 +41,11 @@ nix = { version = "0.31.0", features = ["signal"] }
 mupdf = { git = "https://github.com/messense/mupdf-rs.git", rev = "d7441b9998c92135e329559c0aa71d9dc92cf4de", default-features = false, features = ["svg", "system-fonts", "img"] }
 rayon = { version = "1", default-features = false }
 # kittage = { path = "../kittage/", features = ["crossterm-tokio", "image-crate", "log"] }
-kittage = { version = "0.3.4", features = ["crossterm-tokio", "image-crate", "log"] }
+kittage = { version = "0.4.0", features = ["crossterm-tokio", "image-crate", "log"] }
 memmap2 = "0"
 csscolorparser = { version = "0.8.0", default-features = false }
 debounce = "0.2.2"
+smallvec = "1"
 
 # logging
 log = "0.4.27"
@@ -53,18 +54,8 @@ flexi_logger = "0.31"
 # for tracing with tokio-console
 console-subscriber = { version = "0.5.0", optional = true }
 
-[profile.production]
-inherits = "release"
-lto = "fat"
-
-[features]
-default = []
-tracing = ["tokio/tracing", "dep:console-subscriber"]
-epub = ["mupdf/epub"]
-cbz = ["mupdf/cbz"]
-
 [patch.crates-io]
-kittage = { path = "./vendor-kittage" }
+pathfinder_simd = { git = "https://github.com/itsjunetime/pathfinder.git", rev = "814671e162a1829e074521446317b915311d3d4d" }
 
 [dev-dependencies]
 criterion = { version = "0.8.0", features = ["async_tokio"] }
@@ -77,6 +68,16 @@ harness = false
 [[bin]]
 name = "for_profiling"
 path = "./benches/for_profiling.rs"
+
+[profile.production]
+inherits = "release"
+lto = "fat"
+
+[features]
+default = []
+tracing = ["tokio/tracing", "dep:console-subscriber"]
+epub = ["mupdf/epub"]
+cbz = ["mupdf/cbz"]
 
 [lints.clippy]
 alloc_instead_of_core = "warn"
