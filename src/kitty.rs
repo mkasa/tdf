@@ -265,10 +265,7 @@ async fn run_action_at<'es>(
 
 /// Like [`write_action_without_response`], but first positions the cursor. The non-tmux
 /// counterpart of [`run_action_at`] for terminals which never acknowledge these actions.
-fn write_action_without_response_at(
-	action: &Action<'_, '_>,
-	pos: Position
-) -> std::io::Result<()> {
+fn write_action_without_response_at(action: &Action<'_, '_>, pos: Position) -> std::io::Result<()> {
 	execute!(std::io::stdout(), MoveTo(pos.x, pos.y))?;
 	write_action_without_response(action, None)
 }
