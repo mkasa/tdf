@@ -341,6 +341,15 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
 	let tmux_offset = (is_kitty && in_tmux).then(|| get_tmux_pane_offset().unwrap_or((0, 0)));
 
+	// WezTerm's kitty graphics implementation never acknowledges `i=` transmissions or
+	// placements (it only responds to queries and `I=` transmissions), so waiting for a
+	// response would stall every redraw until kittage's 60s read timeout. Fire-and-forget
+	// there instead; we assign our own image ids anyway. WEZTERM_PANE also catches running
+	// inside tmux, where TERM_PROGRAM is overwritten.
+	let is_wezterm = std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "WezTerm")
+		|| std::env::var_os("WEZTERM_PANE").is_some();
+	let expect_responses = !is_wezterm;
+
 	let shms_work = is_kitty && do_shms_work(&mut ev_stream, tmux_offset).await;
 
 	tokio::spawn(run_conversion_loop(
@@ -430,7 +439,8 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		main_area,
 		font_size,
 		tmux_offset,
-		shms_work
+		shms_work,
+		expect_responses
 	)
 	.await
 	.map_err(|e| {
@@ -468,7 +478,8 @@ async fn enter_redraw_loop(
 	mut main_area: tdf::tui::RenderLayout,
 	font_size: FontSize,
 	tmux_offset: Option<(u16, u16)>,
-	shms_work: bool
+	shms_work: bool,
+	expect_responses: bool
 ) -> Result<(), Box<dyn Error>> {
 	let mut app_focused = true;
 	let mut kitty_z_idx = i32::MIN;
@@ -587,6 +598,7 @@ async fn enter_redraw_loop(
 					ev_stream,
 					tmux_offset,
 					shms_work,
+					expect_responses,
 					&mut kitty_z_idx
 				)
 				.await;

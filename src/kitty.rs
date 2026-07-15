@@ -263,6 +263,16 @@ async fn run_action_at<'es>(
 	}
 }
 
+/// Like [`write_action_without_response`], but first positions the cursor. The non-tmux
+/// counterpart of [`run_action_at`] for terminals which never acknowledge these actions.
+fn write_action_without_response_at(
+	action: &Action<'_, '_>,
+	pos: Position
+) -> std::io::Result<()> {
+	execute!(std::io::stdout(), MoveTo(pos.x, pos.y))?;
+	write_action_without_response(action, None)
+}
+
 /// Write unicode placeholder characters for a Kitty image to stdout (tmux's virtual terminal).
 /// The image ID is encoded in the 24-bit foreground color; row/column indices are 1:1 with
 /// display cells.
@@ -359,6 +369,7 @@ pub async fn display_kitty_images<'es>(
 	ev_stream: &'es mut EventStream,
 	tmux_offset: Option<(u16, u16)>,
 	shms_work: bool,
+	expect_responses: bool,
 	last_z_index: &mut i32
 ) -> Result<(), DisplayErr<'es>> {
 	let images = match display {
@@ -419,37 +430,54 @@ pub async fn display_kitty_images<'es>(
 								NumberOrId::Number(n) => n
 							};
 
-							run_action(
-								Action::TransmitAndDisplay {
-									image: fake_image,
-									config,
-									placement_id: Some(pid)
-								},
-								ev_stream,
-								tmux_offset
-							)
-							.await
-							.map_err(DisplayErrSource::Transmission)
-							.and_then(|img_id| {
-								img_id
-									.inspect(|&id| {
-										*image_state = MaybeTransferred::Transferred(id);
+							let action = Action::TransmitAndDisplay {
+								image: fake_image,
+								config,
+								placement_id: Some(pid)
+							};
+
+							if expect_responses {
+								run_action(action, ev_stream, tmux_offset)
+									.await
+									.map_err(DisplayErrSource::Transmission)
+									.and_then(|img_id| {
+										img_id
+											.inspect(|&id| {
+												*image_state = MaybeTransferred::Transferred(id);
+											})
+											.ok_or(DisplayErrSource::KittageReturnedNoId)
 									})
-									.ok_or(DisplayErrSource::KittageReturnedNoId)
-							})
+							} else {
+								write_action_without_response(&action, tmux_offset)
+									.map(|()| {
+										*image_state = MaybeTransferred::Transferred(pid);
+										pid
+									})
+									.map_err(|e| {
+										DisplayErrSource::Transmission(TransmitError::Writing(e))
+									})
+							}
 						}
-						MaybeTransferred::Transferred(image_id) => run_action(
-							Action::Display {
+						MaybeTransferred::Transferred(image_id) => {
+							let action = Action::Display {
 								image_id: *image_id,
 								placement_id: *image_id,
 								config
-							},
-							ev_stream,
-							tmux_offset
-						)
-						.await
-						.map(|_: Option<ImageId>| *image_id)
-						.map_err(DisplayErrSource::Transmission)
+							};
+
+							if expect_responses {
+								run_action(action, ev_stream, tmux_offset)
+									.await
+									.map(|_: Option<ImageId>| *image_id)
+									.map_err(DisplayErrSource::Transmission)
+							} else {
+								write_action_without_response(&action, tmux_offset)
+									.map(|()| *image_id)
+									.map_err(|e| {
+										DisplayErrSource::Transmission(TransmitError::Writing(e))
+									})
+							}
+						}
 					};
 
 					image_id.and_then(|image_id| {
@@ -522,7 +550,7 @@ pub async fn display_kitty_images<'es>(
 								placement_id: Some(placement_id)
 							};
 
-							let transfer = if shms_work {
+							let transfer = if shms_work && expect_responses {
 								run_action(action, ev_stream, tmux_offset).await
 							} else {
 								write_action_without_response(&action, tmux_offset)
@@ -578,37 +606,56 @@ pub async fn display_kitty_images<'es>(
 						};
 						std::mem::swap(image, &mut fake_image);
 
-						run_action_at(
-							Action::TransmitAndDisplay {
-								image: fake_image,
-								config,
-								placement_id: None
-							},
-							ev_stream,
-							tmux_offset,
-							pos
-						)
-						.await
-						.map_err(DisplayErrSource::Transmission)
-						.and_then(|img_id| {
-							img_id
-								.map(|id| *image_state = MaybeTransferred::Transferred(id))
-								.ok_or(DisplayErrSource::KittageReturnedNoId)
-						})
+						let image_id = match fake_image.num_or_id {
+							NumberOrId::Id(id) => id,
+							NumberOrId::Number(n) => n
+						};
+
+						let action = Action::TransmitAndDisplay {
+							image: fake_image,
+							config,
+							placement_id: None
+						};
+
+						if expect_responses {
+							run_action_at(action, ev_stream, tmux_offset, pos)
+								.await
+								.map_err(DisplayErrSource::Transmission)
+								.and_then(|img_id| {
+									img_id
+										.map(|id| {
+											*image_state = MaybeTransferred::Transferred(id);
+										})
+										.ok_or(DisplayErrSource::KittageReturnedNoId)
+								})
+						} else {
+							write_action_without_response_at(&action, pos)
+								.map(|()| {
+									*image_state = MaybeTransferred::Transferred(image_id);
+								})
+								.map_err(|e| {
+									DisplayErrSource::Transmission(TransmitError::Writing(e))
+								})
+						}
 					}
-					MaybeTransferred::Transferred(image_id) => run_action_at(
-						Action::Display {
+					MaybeTransferred::Transferred(image_id) => {
+						let action = Action::Display {
 							image_id: *image_id,
 							placement_id: *image_id,
 							config
-						},
-						ev_stream,
-						tmux_offset,
-						pos
-					)
-					.await
-					.map(|_: Option<ImageId>| ())
-					.map_err(DisplayErrSource::Transmission)
+						};
+
+						if expect_responses {
+							run_action_at(action, ev_stream, tmux_offset, pos)
+								.await
+								.map(|_: Option<ImageId>| ())
+								.map_err(DisplayErrSource::Transmission)
+						} else {
+							write_action_without_response_at(&action, pos).map_err(|e| {
+								DisplayErrSource::Transmission(TransmitError::Writing(e))
+							})
+						}
+					}
 				},
 				KittyImage::Dynamic(_) =>
 					unreachable!("dynamic kitty images are only used under tmux"),
