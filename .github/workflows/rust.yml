@@ -53,14 +53,18 @@ jobs:
           packages: libfontconfig1-dev libgoogle-perftools-dev google-perftools
           version: latest # could be anything
 
-      - name: Install clippy and fmt
-        run: rustup component add clippy rustfmt
+      # .rustfmt.toml uses nightly-only options, so fmt runs on nightly
+      # while everything else builds on the pinned stable toolchain
+      - name: Install clippy and nightly fmt
+        run: |
+          rustup component add clippy
+          rustup toolchain install nightly --profile minimal --component rustfmt
       - name: Clippy
         run: cargo clippy --locked -- -D warnings
       - name: Tests
         run: cargo test --locked
       - name: Check fmt
-        run: cargo fmt -- --check
+        run: cargo +nightly fmt -- --check
       - name: Run benchmarks as tests
         run: cargo test --locked --benches -- adobe_example
 
